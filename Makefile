@@ -1,4 +1,4 @@
-obj-m += continfo_pr2_so1_201905884.o
+obj-m += pr2_so1_201905884.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
