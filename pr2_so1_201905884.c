@@ -48,8 +48,12 @@
 /*
  * El linux/cgroup.h se utiliza para trabajar con cgroups, aunque en este módulo no se utiliza directamente, pero se incluye por si se necesita acceder a información relacionada con cgroups en el futuro.
  * El linux/slab.h se incluye para utilizar las funciones de asignación de memoria dinámica del kernel, como kmalloc y kfree, que se utilizan para gestionar la memoria del buffer de cmdline en la función continfo_show. 
+ * El linux/memcontrol.h se incluye para acceder a la función task_get_css, que se utiliza para obtener el estado del subsistema de cgroup de un proceso, aunque esta función puede no estar disponible en todos los kernels dependiendo de la configuración.
  */
 #include <linux/cgroup.h>       // cgroup_path
+#ifdef CONFIG_MEMCG
+#include <linux/memcontrol.h>   // memory_cgrp_subsys_id
+#endif
 #include <linux/slab.h>         // kmalloc, kfree
 
 // * Definiciones de constantes para los nombres de las entradas en /proc, utilizando el número de carnet para personalizarlo.
@@ -59,7 +63,7 @@
 
 // * La cmdline tiene como función mostrar la línea de comandos con la que se ejecutó cada proceso, lo cual es útil 
 // * para identificar procesos específicos, especialmente en un entorno con contenedores Docker.
-#define CMDLINE_SIZE 256  // Tamaño máximo para cmdline
+#define CGROUP_PATH_MAX 512  // Tamaño máximo para cmdline
 
 // * Declaración de punteros a las entradas del sistema de archivos proc para meminfo y continfo, que se utilizarán 
 // * para crear y gestionar estas entradas en el módulo del kernel.
@@ -110,54 +114,62 @@ static bool is_general_process(const struct task_struct *task)
 
 static bool task_in_container_by_cgroup2(struct task_struct *task, const char *cid)
 {
+#ifdef CONFIG_MEMCG
     char *path; // Buffer para almacenar el path del cgroup
-    struct cgroup_subsys_state *css; // Estructura para almacenar el estado del subsistema de cgroup
-    bool mathes = false; // Variable para indicar si el CID coincide con el path del cgroup
+    struct cgroup_subsys_state *css = NULL; // Estructura para almacenar el estado del subsistema de cgroup
+    bool match = false; // Variable para indicar si el CID coincide con el path del cgroup
 
     if(!cid || !*cid) {
         return false; // Si el CID es nulo o vacío, no se puede determinar si el proceso está en un contenedor
     }
 
-    path = kmalloc(PATH_MAX, GFP_KERNEL); // Asignar memoria para el buffer del path utilizando kmalloc, que es una función del kernel para asignar memoria dinámica. Se utiliza GFP_KERNEL para indicar que la asignación se realiza en el contexto del kernel.
+    path = kmalloc(CGROUP_PATH_MAX, GFP_KERNEL); // Asignar memoria para el buffer del path utilizando kmalloc, que es una función del kernel para asignar memoria dinámica. Se utiliza GFP_KERNEL para indicar que la asignación se realiza en el contexto del kernel.
     if(!path) {
         return false; // Si no se pudo asignar memoria para el buffer del path, no se puede determinar si el proceso está en un contenedor
     }
 
     /*
-	 * En cgroup v2, el "default hierarchy" se trata como subsistema unificado.
-	 ? Usamos task_get_css() con &cgroup_subsys[0] NO es correcto/estable.
-	 * La forma típica es usar task_get_css() para el subsistema "cpu"/"memory", etc.,
-	 * Necesitamos cgroup del task en el árbol unificado. En kernels actuales,
-	 * el css está asociado a un subsistema concreto; para obtener un path que incluya
-	 * el nombre del cgroup del contenedor, escoger "memory" suele funcionar.
-	 *
-     ! Nota:
-	 * Si el kernel no tiene memory cgroup habilitado, hay que cambiar a "cpu" u otro.
-	 */
+    * En cgroup v2, el "default hierarchy" se trata como subsistema unificado.
+    ? Usamos task_get_css() con &cgroup_subsys[0] NO es correcto/estable.
+    * La forma típica es usar task_get_css() para el subsistema "cpu"/"memory", etc.,
+    * Necesitamos cgroup del task en el árbol unificado. En kernels actuales,
+    * el css está asociado a un subsistema concreto; para obtener un path que incluya
+    * el nombre del cgroup del contenedor, escoger "memory" suele funcionar.
+    *
+    ! Nota:
+    * Si el kernel no tiene memory cgroup habilitado, hay que cambiar a "cpu" u otro.
+    */
 
-    #ifdef CONFIG_MEMCG
-	css = task_get_css(task, memory_cgrp_subsys_id);
-    #else
-        css = NULL;
-    #endif
-        if (!css) {
-            kfree(path);
-            return false;
-        }
+    /*
+    * Intentar obtener el css para el subsistema de memoria, que es comúnmente utilizado para identificar contenedores
+    * en cgroup v2. Si el kernel no tiene habilitado el subsistema de memoria, esta función puede no funcionar correctamente.
+    */    
+    css = task_get_css(task, memory_cgrp_id);
 
-        /*
-        * cgroup_path() devuelve la longitud escrita o <0 en error.
-        * El path típico en cgroup2 se ve como:
-        *   /system.slice/docker-<CID>.scope
-        * o /docker/<CID>...
-        */
-        if (cgroup_path(css->cgroup, path, CGROUP_PATH_MAX) > 0) {
-            if (strnstr(path, cid, CGROUP_PATH_MAX))
-                match = true;
-        }
 
+    if (!css) {
         kfree(path);
-        return match; // Devolver true si el CID coincide con el path del cgroup, indicando que el proceso está en un contenedor, o false en caso contrario
+        return false;
+    }
+
+    /*
+    * cgroup_path() devuelve la longitud escrita o <0 en error.
+    * El path típico en cgroup2 se ve como:
+    *   /system.slice/docker-<CID>.scope
+    * o /docker/<CID>...
+    */
+    if (cgroup_path(css->cgroup, path, CGROUP_PATH_MAX) > 0) {
+        if (strnstr(path, cid, CGROUP_PATH_MAX))
+            match = true;
+    }
+
+    kfree(path);
+    return match; // Devolver true si el CID coincide con el path del cgroup, indicando que el proceso está en un contenedor, o false en caso contrario
+#else
+    (void)task;
+    (void)cid;
+    return false;
+#endif
 }
 
 /**
@@ -181,9 +193,10 @@ static int meminfo_show(struct seq_file *m, void *v)
     used_kb = (total_kb >= free_kb) ? (total_kb - free_kb) : 0; // Calcular la memoria usada en KB, asegurando que no sea negativa
     
     // Mostrar la información de memoria en KB
-    seq_printf(m, "Total RAM: %lu KB\n", (u64)total_kb);
-    seq_printf(m, "Free RAM: %lu KB\n", (u64)free_kb);
-    seq_printf(m, "Used RAM: %lu KB\n", (u64)used_kb);
+    /* En meminfo_show: */
+    seq_printf(m, "Total RAM: %llu KB\n", (unsigned long long)total_kb);
+    seq_printf(m, "Free RAM:  %llu KB\n", (unsigned long long)free_kb);
+    seq_printf(m, "Used RAM:  %llu KB\n", (unsigned long long)used_kb);;
 
     return 0; // Indicar que la función se ejecutó correctamente
 }
@@ -232,7 +245,7 @@ static int continfo_show(struct seq_file *m, void *v)
     u64 mem_total_kb; // Variable para almacenar la memoria total en KB
 
     si_meminfo(&i); // Obtener la información de memoria del sistema
-    total_kb = ((u64)i.totalram * (u64)i.mem_unit) / 1024; // Calcular la memoria total en KB
+    mem_total_kb = ((u64)i.totalram * (u64)i.mem_unit) / 1024; // Calcular la memoria total en KB
     
     if(!mem_total_kb)
     {
@@ -272,18 +285,21 @@ static int continfo_show(struct seq_file *m, void *v)
 
 			mem_pct = (rss_kb * 100) / mem_total_kb;
 
-			seq_printf(m, "%d\t%s\t%llu\t%llu\t%llu\t%llu\t%s\n",
-				   task->pid,
-				   task->comm,
-				   vsz_kb,
-				   rss_kb,
-				   mem_pct,
-				   (u64)(task->utime + task->stime),
-				   (container_id && *container_id) ? container_id : "-");
-		}
+            const char *cid_out = "-";
+            if (container_id && *container_id && task_in_container_by_cgroup2(task, container_id))
+                cid_out = container_id;
 
-        return 0; // Indicar que la función se ejecutó correctamente
+			seq_printf(m, "%d\t%s\t%llu\t%llu\t%llu\t%llu\t%s\n",
+                        task->pid, task->comm,
+                        (unsigned long long)vsz_kb,
+                        (unsigned long long)rss_kb,
+                        (unsigned long long)mem_pct,
+                        (unsigned long long)(task->utime + task->stime),
+                        cid_out);          
+		}
     }
+
+    return 0; // Indicar que la función se ejecutó correctamente
 }
 
 /**
@@ -316,13 +332,16 @@ static const struct proc_ops continfo_ops = {
 
 /**
  * Función de inicialización del módulo, que se ejecuta cuando el módulo es cargado en el kernel.
- * Esta función crea las entradas en el sistema de archivos proc para meminfo y continfo, y maneja los errores en caso de que no se puedan crear las entradas.
- * Si la creación de la entrada para meminfo falla, se devuelve un error de memoria. Si la creación de la entrada para continfo falla, se elimina la entrada de meminfo creada previamente y se devuelve un error de memoria.
- * Si ambas entradas se crean correctamente, se imprime un mensaje de información en el log del kernel indicando que las entradas se han creado exitosamente.   
+ * Esta función crea las entradas en el sistema de archivos proc para meminfo y continfo utilizando proc_create, y luego imprime un 
+ * mensaje de información en el log del kernel indicando que las entradas han sido creadas exitosamente.
+ * Si la creación de alguna de las entradas falla, se limpian las entradas creadas previamente y se devuelve un error de memoria (-ENOMEM).
+ * Además, se verifica si el parámetro container_id ha sido especificado y se imprime una advertencia si no lo ha sido, indicando
+ *  que solo se listarán procesos generales. También se verifica si la configuración CONFIG_MEMCG está habilitada y se imprime 
+ * una advertencia si no lo está, indicando que no se podrán filtrar procesos por cgroup (solo generales).   
  */
 static int __init pr2_module_init(void)
 {
-	proc_meminfo_entry = proc_create(PROC_MEMINFO_NAME, 0444, NULL, &meminfo_ops);
+	proc_meminfo_entry = proc_create(PROC_MEMINFO_NAME, 0444, NULL, &meminfo_fops);
 	if (!proc_meminfo_entry)
 		return -ENOMEM;
 
@@ -334,10 +353,13 @@ static int __init pr2_module_init(void)
 
 	pr_info("PR2 SO1 %s: /proc/%s y /proc/%s creados\n",
 		CARNET, PROC_MEMINFO_NAME, PROC_CONTINFO_NAME);
-	
-    // Advertencia si no se especificó container_id, ya que solo se listarán procesos generales relacionados con Docker.
-        if (!container_id || !*container_id)
-	pr_warn("PR2 SO1 %s: container_id no especificado; solo se listaran procesos generales\n", CARNET);
+
+	if (!container_id || !*container_id)
+		pr_warn("PR2 SO1 %s: container_id no especificado; solo se listaran procesos generales\n", CARNET);
+
+#ifndef CONFIG_MEMCG
+	pr_warn("PR2 SO1 %s: CONFIG_MEMCG deshabilitado; no se podran filtrar procesos por cgroup (solo generales)\n", CARNET);
+#endif
 
 	return 0;
 }
