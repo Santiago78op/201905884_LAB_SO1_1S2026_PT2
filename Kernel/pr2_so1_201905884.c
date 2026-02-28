@@ -112,6 +112,14 @@ static bool is_general_process(const struct task_struct *task)
  * En kernels "generic" usualmente están disponibles.
  */
 
+ /**
+  * @brief Función para verificar si un proceso pertenece a un contenedor específico basado en su cgroup v2 path.
+  * 
+  * @param task 
+  * @param cid 
+  * @return true 
+  * @return false 
+  */
 static bool task_in_container_by_cgroup2(struct task_struct *task, const char *cid)
 {
 #ifdef CONFIG_MEMCG
@@ -123,9 +131,13 @@ static bool task_in_container_by_cgroup2(struct task_struct *task, const char *c
         return false; // Si el CID es nulo o vacío, no se puede determinar si el proceso está en un contenedor
     }
 
-    path = kmalloc(CGROUP_PATH_MAX, GFP_KERNEL); // Asignar memoria para el buffer del path utilizando kmalloc, que es una función del kernel para asignar memoria dinámica. Se utiliza GFP_KERNEL para indicar que la asignación se realiza en el contexto del kernel.
+    /*
+    * Asignar memoria para el buffer del path utilizando kmalloc, que es una función del kernel para asignar memoria dinámica. 
+    * Se utiliza GFP_ATOMIC para indicar que la asignación se realiza en un contexto atómico (no bloqueante).
+    */
+    path = kmalloc(CGROUP_PATH_MAX, GFP_ATOMIC); 
     if(!path) {
-        return false; // Si no se pudo asignar memoria para el buffer del path, no se puede determinar si el proceso está en un contenedor
+        return false; // Si no se pudo asignar memoria para el buffer del path, no se puede determinar si el proceso está en un contenedor.
     }
 
     /*
@@ -153,16 +165,17 @@ static bool task_in_container_by_cgroup2(struct task_struct *task, const char *c
     }
 
     /*
-    * cgroup_path() devuelve la longitud escrita o <0 en error.
+    * En kernels modernos (5.x+), cgroup_path() retorna 0 si tuvo éxito y un valor negativo (-errno) si falló. 
     * El path típico en cgroup2 se ve como:
     *   /system.slice/docker-<CID>.scope
     * o /docker/<CID>...
     */
-    if (cgroup_path(css->cgroup, path, CGROUP_PATH_MAX) > 0) {
+    if (cgroup_path(css->cgroup, path, CGROUP_PATH_MAX) == 0) {
         if (strnstr(path, cid, CGROUP_PATH_MAX))
             match = true;
     }
 
+    css_put(css); // Liberar la referencia al css obtenida con task_get_css para evitar fugas de memoria
     kfree(path);
     return match; // Devolver true si el CID coincide con el path del cgroup, indicando que el proceso está en un contenedor, o false en caso contrario
 #else
@@ -192,11 +205,11 @@ static int meminfo_show(struct seq_file *m, void *v)
     free_kb = ((u64)i.freeram * (u64)i.mem_unit) / 1024; // Calcular la memoria libre en KB
     used_kb = (total_kb >= free_kb) ? (total_kb - free_kb) : 0; // Calcular la memoria usada en KB, asegurando que no sea negativa
     
-    // Mostrar la información de memoria en KB
+    // Mostrar la información de memoria en MB
     /* En meminfo_show: */
-    seq_printf(m, "Total RAM: %llu KB\n", (unsigned long long)total_kb);
-    seq_printf(m, "Free RAM:  %llu KB\n", (unsigned long long)free_kb);
-    seq_printf(m, "Used RAM:  %llu KB\n", (unsigned long long)used_kb);;
+    seq_printf(m, "RAM_TOTAL_MB=%llu\n", (unsigned long long)(total_kb / 1024));
+    seq_printf(m, "RAM_FREE_MB=%llu\n",  (unsigned long long)(free_kb / 1024));
+    seq_printf(m, "RAM_USED_MB=%llu\n",  (unsigned long long)(used_kb / 1024));
 
     return 0; // Indicar que la función se ejecutó correctamente
 }
@@ -243,6 +256,7 @@ static int continfo_show(struct seq_file *m, void *v)
     struct task_struct *task; // Estructura para iterar sobre los procesos
     struct sysinfo i; // Estructura para almacenar la información del sistema
     u64 mem_total_kb; // Variable para almacenar la memoria total en KB
+    int containers_active = 0; // Contador para el número de procesos activos en el contenedor
 
     si_meminfo(&i); // Obtener la información de memoria del sistema
     mem_total_kb = ((u64)i.totalram * (u64)i.mem_unit) / 1024; // Calcular la memoria total en KB
@@ -255,17 +269,33 @@ static int continfo_show(struct seq_file *m, void *v)
     seq_printf(m, "container_id=%s\n", container_id ? container_id : "(none)"); // Imprimir el container_id que se está utilizando para filtrar los procesos, o "(none)" si no se ha especificado un container_id
     seq_printf(m, "PID\tNAME\tVSZ_(KB)\tRSS_(KB)\t%%MEM_PCT\t%%CPU_RAW\tCONTAINER_ID\n"); // Imprimir encabezado de la tabla
 
+    /*
+    * Se llama a rcu_read_lock() para proteger la sección de código que accede a la lista de procesos, 
+    * ya que for_each_process puede acceder a estructuras de datos que pueden ser modificadas por otros hilos o procesos. 
+    * Esto asegura que la información de los procesos sea consistente durante la iteración.
+    */
+    rcu_read_lock();
+    
     // Iterar sobre todos los procesos en el sistema utilizando for_each_process, que es una macro que permite recorrer la lista de procesos.
     for_each_process(task) {
         bool include = false; // Variable para determinar si se debe incluir el proceso en la salida
+        bool in_cgroup = false; // Variable para determinar si el proceso está en el cgroup especificado por container_id
 
         if(is_general_process(task)) {
             include = true; // Incluir procesos generales relacionados con Docker
         }
 
+        /*
+         * Si se ha especificado un container_id, verificar si el proceso pertenece al cgroup correspondiente utilizando task_in_container_by_cgroup2. 
+         * Si el proceso pertenece al cgroup, se establece include en true para incluirlo en la salida.
+         * Esto permite filtrar los procesos para mostrar solo aquellos que están relacionados con el contenedor especificado por container_id.
+         * Si no se ha especificado un container_id, solo se incluirán los procesos generales relacionados con Docker.
+        */
         if(!include && container_id && *container_id) {
-           if(task_in_container_by_cgroup2(task, container_id)) {
-                include = true; // Incluir procesos que coincidan con el container_id en su cgroup v2 path
+            in_cgroup = task_in_container_by_cgroup2(task, container_id);
+            if(in_cgroup) {
+                include = true;
+                containers_active++; // Contar el número de procesos activos en el contenedor.
             }
         }
 
@@ -275,18 +305,25 @@ static int continfo_show(struct seq_file *m, void *v)
 
         // * Metricas de memoria del proceso
         {
-            struct mm_struct *mm = task->mm;
-			u64 vsz_kb = 0, rss_kb = 0, mem_pct = 0;
+            /*
+             * - get_task_mm() adquiere el lock interno y eleva el refcount atomicamente.
+             * - mmput() decrementa cuando se libera el mm_struct, lo que puede liberar la memoria si el refcount llega a cero.
+             * - Si el proceso no tiene espacio de memoria (kernel thread), retorna NULL y el bloque if no ejecuta.
+            */
+            struct mm_struct *mm;
+            u64 vsz_kb = 0, rss_kb = 0, mem_pct = 0;
 
-			if (mm) {
-				vsz_kb = (u64)mm->total_vm << (PAGE_SHIFT - 10);
-				rss_kb = (u64)get_mm_rss(mm) << (PAGE_SHIFT - 10);
-			}
+            mm = get_task_mm(task);
+            if (mm) {
+                vsz_kb = (u64)mm->total_vm << (PAGE_SHIFT - 10);
+                rss_kb = (u64)get_mm_rss(mm) << (PAGE_SHIFT - 10);
+                mmput(mm);
+            }
 
 			mem_pct = (rss_kb * 100) / mem_total_kb;
 
             const char *cid_out = "-";
-            if (container_id && *container_id && task_in_container_by_cgroup2(task, container_id))
+            if (in_cgroup)
                 cid_out = container_id;
 
 			seq_printf(m, "%d\t%s\t%llu\t%llu\t%llu\t%llu\t%s\n",
@@ -298,6 +335,15 @@ static int continfo_show(struct seq_file *m, void *v)
                         cid_out);          
 		}
     }
+    
+    /* 
+    * Se llama a rcu_read_unlock() para liberar el bloqueo de lectura de RCU después de haber terminado de acceder a la lista de procesos. 
+    * Esto permite que otros hilos o procesos puedan modificar la lista de procesos nuevamente.
+    */
+    rcu_read_unlock();
+
+    // Imprimir el número de procesos activos en el contenedor, que se cuenta durante la iteración sobre los procesos. Este valor se muestra al principio de la salida para indicar cuántos procesos relacionados con el contenedor están activos.
+    seq_printf(m, "CONTAINERS_ACTIVE=%d\n", containers_active); 
 
     return 0; // Indicar que la función se ejecutó correctamente
 }
