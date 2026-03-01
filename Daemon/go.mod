@@ -1,4 +1,4 @@
-module cmd/daemon
+module Daemon
 
 go 1.25.6
 
