@@ -66,10 +66,10 @@ func ParserContInfo(raw string) (model.ContainerReport, error) {
 		processInfo, err := ParserProcessLine(line)
 		if err != nil {
 			continue // Si hay un error de parseo, se ignora esta línea y se continúa con la siguiente
+		} else {
+			// * Si se parseó correctamente, se agrega el ProcessInfo al slice de procesos del reporte.
+			report.Processes = append(report.Processes, processInfo)
 		}
-
-		// * Si se parseó correctamente, se agrega el ProcessInfo al slice de procesos del reporte.
-		report.Processes = append(report.Processes, processInfo)
 
 	}
 
