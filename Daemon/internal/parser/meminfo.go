@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	model "Daemon/internal/model"
+	model "daemon/internal/model"
 )
 
 /**
@@ -44,7 +44,7 @@ func ParseMemInfo(raw string) (model.MemStats, error) {
 		key := strings.TrimSpace(parts[0])
 		valueStr := strings.TrimSpace(parts[1])
 
-		// Switch sobre la clave, parsea cada valor con strconv.ParseUint(valor, 10, 64) y asígnalo al campo correcto
+		// Switch sobre la clave, parsea cada valor con strconv.ParseUint(valor, 10, 64) y se asigna al campo correcto
 		switch key {
 		case "RAM_TOTAL_MB":
 			value, err := strconv.ParseUint(valueStr, 10, 64)
@@ -67,7 +67,7 @@ func ParseMemInfo(raw string) (model.MemStats, error) {
 		}
 	}
 
-	// Se agrega un timestamp al struct, si es necesario.
+	// Se agrega un timestamp al struct, para registrar cuándo se obtuvieron los datos.
 	memStats.Timestamp = time.Now()
 
 	// Valida que MemTotal != 0 para evitar divisiones por cero o datos inválidos.
@@ -75,6 +75,7 @@ func ParseMemInfo(raw string) (model.MemStats, error) {
 		return memStats, fmt.Errorf("RAM_TOTAL_MB cannot be zero")
 	}
 
+	// Se retorna el struct con los datos parseados o un error si ocurrió algún problema durante el proceso.
 	return memStats, nil
 
 }
