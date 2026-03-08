@@ -1,3 +1,112 @@
+# Enunciado del Proyecto
+
+En la administración de sistemas y el desarrollo de aplicaciones contenerizadas, obtener
+información detallada sobre los procesos en ejecución y tomar acciones automatizadas es
+un desafío crítico. Aunque herramientas como ps o docker stats ofrecen datos básicos,
+carecen de acceso directo a las estructuras del kernel y no permiten una gestión proactiva
+de contenedores. Este proyecto propone una solución integral: desarrollar un módulo de
+kernel en C que exponga métricas avanzadas de procesos y contenedores (CPU, memoria,
+E/S) a través de /proc, junto con un Daemon en GO que no solo presente estos datos de
+forma legible, sino que también automatice decisiones (como terminar contenedores que
+excedan umbrales de recursos) a su vez que guarda datos importantes en Valkey para su
+posterior uso en Grafana. Para validar el sistema, se implementará cronjobs que generen
+contenedores de prueba cada minuto, simulando condiciones de carga y permitiendo
+evaluar la eficacia de las acciones correctivas. Así, el proyecto combina aprendizaje en
+programación a bajo nivel (kernel) y alto nivel (GO), mientras resuelve un problema real en
+entornos contenerizados: la monitorización y estabilización autónoma del sistema. A su vez
+que de dichos datos se mostraran de manera visual por medio de un dashboard en Grafana.
+
+1.​ Un módulo de kernel desarrollado en C que actuará como sensor de bajo nivel,
+accediendo directamente a las estructuras internas del kernel para capturar métricas
+detalladas tanto de los procesos asociados a contenedores como de los procesos
+generales del sistema, incluyendo consumo de recursos como CPU, memoria y E/S.
+
+2.​ Una Daemon en GO que funcionará como cerebro del sistema, procesando los
+datos del kernel en tiempo real para:
+
+    ○​ Tomar decisiones autónomas detener y eliminar contenedores basadas en
+    umbrales dinámicos y patrones de comportamiento establecidos
+    previamente.
+    ○​ Simular y validar la eficacia del sistema bajo condiciones de uso prolongado.
+    ○​ Ejecutar scripts de automatización durante la ejecución.
+    
+3.​ Un Cronjob encargado de ejecutar el script que generara los contenedores de
+Docker cada minuto.
+
+4.​ Un Dashboard en Grafana utilizado para mostrar la información que recolecta el
+servicio de GO.
+
+## MÓDULO DE KERNEL
+
+Deberá crear un módulo que capture las métricas necesarias para el análisis de la memoria
+y los contenedores activos en el sistema.
+La información debe ser capturada y guardada en la carpeta /proc:
+
+    1. Capturar en MB o KB (a discreción del estudiante):
+    ●​ Total de memoria RAM
+    ●​ Memoria RAM libre
+    ●​ Memoria RAM en uso​
+
+2. Todos los procesos relacionados a los contenedores generados por el script así
+como los procesos generales del sistema deberán contar con:
+
+    ●​ PID
+    ●​ Nombre
+    ●​ Línea de comando que se ejecutó o ID del contenedor
+    ●​ VSZ (Tamaño de la memoria virtual en KB)
+    ●​ RSS (Tamaño de memoria física en KB)
+    ●​ Porcentaje de Memoria utilizada
+    ●​ Porcentaje de CPU utilizado
+    Sugerencias:
+    ●​ Utilizar la estructura task_struct (del kernel de Linux) para filtrar correctamente los
+    procesos relacionados con los contenedores y extraer la información necesaria.
+    ●​ En dado caso el porcentaje de CPU sea un número extremadamente grande se
+    permite mantenerlo así debido a los cálculos diferenciales que retorna el kernel.​
+
+3. Los datos deberán ser guardados en sus respectivos archivos en /proc
+    ●​ Módulo de Procesos de Contenedores: /proc/continfo_pr2_so1_#CARNET
+
+Daemon de GO
+Descripción (corazón del proyecto):​
+Se requiere desarrollar un gestor de contenedores en Go encargado del análisis,
+ejecución y comunicación entre los diferentes componentes del servicio.​
+Debe garantizar manejo seguro de memoria y cumplir con las siguientes funcionalidades:
+1. Inicio del servicio
+●​ Crear un contenedor de Grafana al inicializar el código.
+●​ Grafana será el encargado de leer los logs generados por el servicio de Go después
+del análisis de los datos.
+●​ Se recomienda utilizar un Docker Compose para que el contenedor se pueda
+comunicar con la base de datos Valkey
+2. Cronjob
+●​ El daemon de Go iniciará la implementación y ejecución del cronjob en el sistema
+operativo, lo que activará el proceso de creación de contenedores.
+3. Ejecución del script para cargar el módulo de kernel
+●​ El daemon de Go ejecutará un script encargado de cargar e inicializar el módulo de
+kernel.
+4. Loop principal (ejecución cada 20 a 60 segundos)
+●​ El daemon operará de manera infinita en segundo plano.
+●​ En cada iteración (cada 20 a 60 segundos), realiza lo siguiente:
+○​ Lectura del archivo en /proc/continfo_pr2_so1_#CARNET
+○​ Deserialización del contenido
+○​ Análisis para la gestión de contenedores (alta/baja, ajuste de recursos)
+■​ detener y eliminar los contenedores según cálculos explicados en la
+siguiente sección.
+○​ Generación y almacenamiento de registros (logs) en una base de datos
+Valkey, diseñado para su posterior visualización en Grafana​
+5. Finalización del servicio
+●​ Antes de finalizar, el servicio deberá eliminar el cronjob asociado a la creación de
+los contenedores para evitar una sobrecarga en el sistema.
+d
+Me encuentro en la fase de desarrollo del Daemon en Go, en la cual necesito implementar la funcionalidad de cargar el módulo de kernel que he desarrollado. Para esto, quiero crear un nuevo paquete en Go que se encargue de ejecutar un script bash que compile y cargue el módulo de kernel, y luego verificar que las entradas en /proc se hayan creado correctamente para que el daemon pueda leerlas posteriormente.
+
+Ya se creo la logica del módulo de kernel el cual se encuentra en la carpeta Kernel, ahora necesito que me muestres como crear el script bash para cargar el módulo y luego como crear el paquete en Go para ejecutarlo desde el main.go del daemon. 
+
+Tambien te indico que la logica que lee los archivos en /proc ya esta implementada, por lo que solo necesito la parte de cargar el módulo y verificar que las entradas en /proc se hayan creado correctamente.
+
+Recuerda que puedes apoyarte de los archivos .md que se encuentran en el repositorio para guiarte en la estructura del proyecto y en la implementación de las funcionalidades, pero quiero que me muestres como crear el script bash y el paquete en Go paso por paso para poder implementarlo y aprender como funciona cada parte.
+
+Anteriormente me indicaste esto en tu terminal, pero no pude seguir asi que te lo vuelvo a mostrar:
+
 ❯ Necesito que me muestres como crearlo paso por paso, para poder implementarlo y aprender como funciona  
 
 ● Perfecto, te lo explico paso a paso para que lo implementes tú mismo.
