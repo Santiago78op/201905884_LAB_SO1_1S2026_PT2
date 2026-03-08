@@ -107,92 +107,159 @@ Recuerda que puedes apoyarte de los archivos .md que se encuentran en el reposit
 
 Anteriormente me indicaste esto en tu terminal, pero no pude seguir asi que te lo vuelvo a mostrar:
 
-❯ Necesito que me muestres como crearlo paso por paso, para poder implementarlo y aprender como funciona  
+❯ Ayudame a realizar esto Inicio del servicio                                                                                                                                                 
+● Crear un contenedor de Grafana al inicializar el código.                                                                                                                                    
+● Grafana será el encargado de leer los logs generados por el servicio de Go después                                                                                                          
+del análisis de los datos.                                                                                                                                                                    
+● Se recomienda utilizar un Docker Compose para que el contenedor se pueda                                                                                                                    
+comunicar con la base de datos Valkey                                                                                                                                                         
 
-● Perfecto, te lo explico paso a paso para que lo implementes tú mismo.
+● Primero leo la documentación del proyecto para entender el contexto completo.
 
-  ---
-  Visión General
+● Read 2 files (ctrl+o to expand)                                                                                                                                                             
+  ⎿  Interrupted · What should Claude do instead?
+                                                                                                                                                                                              
+❯ Inicio del servicio                                                                                                                                                                         
+● Crear un contenedor de Grafana al inicializar el código.                                                                                                                                    
+● Grafana será el encargado de leer los logs generados por el servicio de Go después                                                                                                          
+del análisis de los datos.                                                                                                                                                                    
+● Se recomienda utilizar un Docker Compose para que el contenedor se pueda                                                                                                                    
+comunicar con la base de datos Valkey, siempre indicame como hacerlo paso a paso                                                                                                              
 
-  El flujo que vamos a construir es:
+● Entendido. Aquí tienes el plan completo paso a paso para que lo implementes tú.
 
-  main.go
-    └── kernel.Load()          ← nuevo paquete Go
-          └── ejecuta bash     ← nuevo script .sh
-                ├── make        (compila el .ko si no existe)
-                └── insmod      (carga el módulo)
-                      └── crea /proc/meminfo_... y /proc/continfo_...
-                                ↑ el daemon ya puede leerlos
+  ---                                                                                                                                                                                         
+  Visión general de lo que vamos a construir
+                                                                                                                                                                                              
+  Host (con sudo):                                          
+    Go daemon → pushToValkey() → localhost:6379
+                                        │
+                      ┌─────────────────▼──────────────────┐
+                      │         Docker Compose              │
+                      │                                     │
+                      │  ┌─────────────┐  ┌─────────────┐  │
+                      │  │   valkey    │  │   grafana   │  │
+                      │  │  :6379      │◄─┤  :3000      │  │
+                      │  └─────────────┘  └─────────────┘  │
+                      └─────────────────────────────────────┘
 
-  ---
-  Paso 1 — Crear el script bash
-
-  Crea la carpeta y el archivo:
-
-  mkdir -p scripts
-  touch scripts/load_kernel_module.sh
-  chmod +x scripts/load_kernel_module.sh
-
-  El script tiene 5 responsabilidades. Escríbelo así:
-
-  #!/usr/bin/env bash
-  # Uso: ./scripts/load_kernel_module.sh [CONTAINER_ID]
-  # Requiere: ejecutar como root (sudo) para insmod
-
-  set -euo pipefail
-
-  MODULE_NAME="pr2_so1_201905884"
-  CONTAINER_ID="${1:-}"   # $1 si se pasó, vacío si no
-
-  # ── Calcular rutas ─────────────────────────────────────────
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-  KERNEL_DIR="${PROJECT_ROOT}/Kernel"
-  KO_FILE="${KERNEL_DIR}/${MODULE_NAME}.ko"
-
-  PROC_MEM="/proc/meminfo_${MODULE_NAME}"
-  PROC_CONT="/proc/continfo_${MODULE_NAME}"
-
-  # ── 1. ¿Ya está cargado? ───────────────────────────────────
-  if lsmod | grep -q "^${MODULE_NAME}[[:space:]]"; then
-      echo "[kernel-loader] módulo ya cargado"
-      exit 0
-  fi
-
-  # ── 2. Compilar si el .ko no existe ───────────────────────
-  if [ ! -f "${KO_FILE}" ]; then
-      echo "[kernel-loader] compilando módulo..."
-      make -C "${KERNEL_DIR}"
-  fi
-
-  # ── 3. Cargar con insmod ───────────────────────────────────
-  if [ -n "${CONTAINER_ID}" ]; then
-      insmod "${KO_FILE}" container_id="${CONTAINER_ID}"
-  else
-      insmod "${KO_FILE}"
-  fi
-
-  # ── 4. Verificar /proc ────────────────────────────────────
-  [ -r "${PROC_MEM}"  ] || { echo "ERROR: ${PROC_MEM} no existe"  >&2; exit 1; }
-  [ -r "${PROC_CONT}" ] || { echo "ERROR: ${PROC_CONT} no existe" >&2; exit 1; }
-
-  echo "[kernel-loader] módulo cargado OK"
-
-  ¿Por qué set -euo pipefail? — El script aborta en cualquier error (-e), falla si usas variables no definidas (-u), y propaga errores en pipes (-pipefail).
-
-  ¿Por qué BASH_SOURCE[0]? — Obtiene la ruta del propio script, sin importar desde dónde lo ejecutes.
+  El daemon arranca el compose al iniciar. Grafana lee de Valkey usando el plugin de Redis (Valkey es 100% compatible con Redis).
 
   ---
-  Paso 2 — Crear el paquete kernel en Go
+  Paso 1 — Crear la estructura de carpetas
 
-  Crea la carpeta:
+  En la raíz del proyecto ejecuta:
 
-  mkdir -p Daemon/internal/kernel
-  touch Daemon/internal/kernel/loader.go
+  mkdir -p grafana/provisioning/datasources
+  mkdir -p Daemon/internal/compose
+  touch docker-compose.yml
+  touch grafana/provisioning/datasources/valkey.yml
+  touch Daemon/internal/compose/manager.go
 
-  Escribe el archivo:
+  Tu árbol quedará así:
 
-  package kernel
+  201905884_LAB_SO1_1S2026_PT2/
+  ├── docker-compose.yml                          ← NUEVO
+  ├── grafana/
+  │   └── provisioning/
+  │       └── datasources/
+  │           └── valkey.yml                      ← NUEVO
+  ├── scripts/
+  │   └── load_kernel_module.sh
+  ├── Kernel/
+  └── Daemon/
+      └── internal/
+          └── compose/
+              └── manager.go                      ← NUEVO
+
+  Avísame cuando lo tengas para el Paso 2.
+
+  ---
+  Paso 2 — Escribir el docker-compose.yml
+
+  Abre docker-compose.yml y escribe esto:
+
+  services:
+
+    valkey:
+      image: valkey/valkey:8-alpine
+      container_name: valkey_pr2
+      ports:
+        - "6379:6379"
+      restart: unless-stopped
+
+    grafana:
+      image: grafana/grafana:latest
+      container_name: grafana_pr2
+      ports:
+        - "3000:3000"
+      environment:
+        - GF_SECURITY_ADMIN_PASSWORD=admin
+        - GF_INSTALL_PLUGINS=redis-datasource
+      volumes:
+        - ./grafana/provisioning:/etc/grafana/provisioning
+      depends_on:
+        - valkey
+      restart: unless-stopped
+
+  ¿Qué hace cada parte?
+
+  ┌─────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────┐
+  │               Bloque                │                                       Explicación                                        │
+  ├─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ valkey/valkey:8-alpine              │ Imagen oficial de Valkey (Alpine = imagen mínima)                                        │
+  ├─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ports: "6379:6379"                  │ Expone Valkey al host → el daemon Go puede conectarse en localhost:6379                  │
+  ├─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ GF_INSTALL_PLUGINS=redis-datasource │ Instala el plugin de Redis en Grafana al arrancar (Valkey es compatible con este plugin) │
+  ├─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ volumes: ./grafana/provisioning     │ Monta la carpeta local en Grafana para configuración automática                          │
+  ├─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ depends_on: valkey                  │ Grafana espera a que Valkey esté listo antes de arrancar                                 │
+  └─────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Avísame cuando lo tengas para el Paso 3.
+
+  ---
+  Paso 3 — Configurar el datasource de Valkey en Grafana
+
+  Abre grafana/provisioning/datasources/valkey.yml y escribe:
+
+  apiVersion: 1
+
+  datasources:
+    - name: Valkey
+      type: redis-datasource
+      access: proxy
+      url: redis://valkey:6379
+      isDefault: true
+      editable: true
+
+  ¿Qué hace cada campo?
+
+  ┌──────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │          Campo           │                                                  Explicación                                                   │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ type: redis-datasource   │ Usa el plugin que instalamos con GF_INSTALL_PLUGINS                                                            │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ url: redis://valkey:6379 │ valkey es el nombre del servicio en Docker Compose — los contenedores se resuelven por nombre dentro de la red │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ access: proxy            │ Grafana hace las consultas desde el servidor (no desde el browser)                                             │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ isDefault: true          │ Este datasource se selecciona por defecto al crear panels                                                      │
+  └──────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  ¿Por qué valkey:6379 y no localhost:6379?
+  Dentro de Docker Compose, cada servicio tiene su propio hostname igual al nombre del servicio. localhost dentro del contenedor de Grafana apuntaría a sí mismo, no a Valkey.
+
+  Avísame cuando lo tengas para el Paso 4.
+
+  ---
+  Paso 4 — Crear el paquete Go compose/manager.go
+
+  Abre Daemon/internal/compose/manager.go y escribe esto:
+
+  package compose
 
   import (
       "fmt"
@@ -202,156 +269,134 @@ Anteriormente me indicaste esto en tu terminal, pero no pude seguir asi que te l
       "strings"
   )
 
-  // LoadOpts contiene los parámetros para cargar el módulo.
-  type LoadOpts struct {
-      ScriptPath  string // ruta al script .sh
-      ContainerID string // opcional: ID del contenedor Docker
+  type Opts struct {
+      // ComposeFile es la ruta al docker-compose.yml
+      ComposeFile string
   }
 
-  // Load ejecuta el script y retorna error si falla.
-  func Load(opts LoadOpts) error {
-      // Verificar que el script existe antes de ejecutar
-      if _, err := os.Stat(opts.ScriptPath); err != nil {
-          return fmt.Errorf("kernel: script no encontrado %q: %w", opts.ScriptPath, err)
+  // Up ejecuta "docker compose up -d" con el archivo indicado.
+  // Retorna nil si los contenedores arrancaron correctamente.
+  func Up(opts Opts) error {
+      if _, err := os.Stat(opts.ComposeFile); err != nil {
+          return fmt.Errorf("compose: archivo no encontrado %q: %w", opts.ComposeFile, err)
       }
 
-      // Construir los argumentos: bash <script> [container_id]
-      args := []string{opts.ScriptPath}
-      if opts.ContainerID != "" {
-          args = append(args, opts.ContainerID)
-      }
-
-      // Ejecutar el script capturando stdout + stderr combinados
-      cmd := exec.Command("/bin/bash", args...)
+      cmd := exec.Command("docker", "compose", "-f", opts.ComposeFile, "up", "-d")
       out, err := cmd.CombinedOutput()
 
-      // Loguear cada línea de salida del script
       for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
           if line != "" {
-              log.Printf("%s", line)
+              log.Printf("[compose] %s", line)
           }
       }
 
       if err != nil {
-          return fmt.Errorf("kernel: script falló: %w", err)
+          return fmt.Errorf("compose: docker compose up falló: %w", err)
       }
       return nil
   }
 
   Conceptos clave:
-  - exec.Command("/bin/bash", args...) — ejecuta el script con bash explícito
-  - CombinedOutput() — captura stdout y stderr en un solo slice de bytes
-  - fmt.Errorf(..., %w, err) — wrapping de errores, permite usar errors.Is/As después
+
+  ┌────────────────────────────────────┬────────────────────────────────────────────────────────────────────┐
+  │              Elemento              │                            Explicación                             │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ docker compose -f archivo up -d    │ -f especifica el archivo; -d arranca en modo detached (background) │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ os.Stat() antes de ejecutar        │ Verifica que el archivo existe y da error claro si no              │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ CombinedOutput()                   │ Captura stdout + stderr del proceso docker en un solo buffer       │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Misma estructura que kernel.Load() │ Patrón consistente en todo el proyecto                             │
+  └────────────────────────────────────┴────────────────────────────────────────────────────────────────────┘
+
+  Avísame cuando lo tengas para el Paso 5.
 
   ---
-  Paso 3 — Actualizar main.go
+  Paso 5 — Actualizar main.go
 
-  Necesitas hacer 3 cambios en el main.go existente:
+  Abre Daemon/cmd/daemon/main.go. Necesitas dos cambios:
 
-  A) Agregar los imports que faltan:
+  Cambio A — Agregar el import:
 
   import (
-      "context"
-      "flag"          // ← nuevo
-      "log"
-      "os"
-      "os/signal"
-      "syscall"
-      "time"
-
-      "daemon/internal/app"
-      "daemon/internal/kernel" // ← nuevo
-      "daemon/internal/sink"
-      "daemon/internal/source"
+      // ... imports existentes ...
+      "daemon/internal/compose"  // ← agregar
+      "daemon/internal/kernel"
+      // ...
   )
 
-  B) Agregar los flags y llamar al loader al inicio de main():
+  Cambio B — Llamar a compose.Up() justo después de kernel.Load():
 
-  func main() {
-      // ── Flags de configuración ─────────────────────────────────────
-      kernelScript := flag.String(
-          "kernel-script",
-          "scripts/load_kernel_module.sh",   // default: relativo al CWD
-          "Ruta al script que carga el módulo de kernel",
-      )
-      containerID := flag.String(
-          "container-id",
-          "",
-          "ID del contenedor Docker para filtrar en el módulo",
-      )
-      flag.Parse()
+  // Después de kernel.Load() exitoso:
+  log.Println("main: iniciando contenedores (Grafana + Valkey)...")
+  if err := compose.Up(compose.Opts{
+      ComposeFile: *composeFile,
+  }); err != nil {
+      log.Fatalf("main: no se pudo iniciar los contenedores: %v", err)
+  }
+  log.Println("main: contenedores listos — Grafana en http://localhost:3000")
 
-      // ── Cargar módulo de kernel ────────────────────────────────────
-      log.Println("main: cargando módulo de kernel...")
-      if err := kernel.Load(kernel.LoadOpts{
-          ScriptPath:  *kernelScript,
-          ContainerID: *containerID,
-      }); err != nil {
-          log.Fatalf("main: no se pudo cargar el módulo: %v", err)
-      }
-      log.Println("main: módulo de kernel listo")
+  Y agrega el flag en la sección de flags:
 
-      // ... resto del main sin cambios ...
+  composeFile := flag.String(
+      "compose-file",
+      "docker-compose.yml",
+      "Ruta al docker-compose.yml con Grafana y Valkey",
+  )
 
-  ---
-  Estructura final resultante
+  ¿Por qué compose.Up() va después de kernel.Load()?
+  El orden importa: primero el módulo (fuente de datos), luego la infraestructura de visualización. Si el módulo falla, no tiene sentido levantar Grafana.
 
-  201905884_LAB_SO1_1S2026_PT2/
-  ├── scripts/
-  │   └── load_kernel_module.sh          ← NUEVO
-  ├── Kernel/
-  │   ├── pr2_so1_201905884.c
-  │   └── Makefile
-  └── Daemon/
-      ├── cmd/daemon/main.go             ← MODIFICADO
-      └── internal/
-          ├── kernel/
-          │   └── loader.go              ← NUEVO
-          ├── app/service.go
-          └── ...
+  Cuando termines, compila para verificar:
 
-  ---
-  Paso 4 — Compilar y probar
-
-  # Desde la raíz del proyecto
   cd Daemon
-  go build -o ../daemon_pr2 ./cmd/daemon/
+  go build ./...
 
-  # Ejecutar con el módulo sin container_id
-  cd ..
-  sudo ./daemon_pr2 --kernel-script=scripts/load_kernel_module.sh
+  Avísame cuando lo tengas para el Paso 6.
 
-  # O con container_id
+  ---
+  Paso 6 — Probar el flujo completo
+
+  Desde la raíz del proyecto:
+
+  # 1. Compilar el daemon
+  cd Daemon && go build -o ../daemon_pr2 ./cmd/daemon/ && cd ..
+
+  # 2. Ejecutar (sudo necesario para insmod)
   sudo ./daemon_pr2 \
     --kernel-script=scripts/load_kernel_module.sh \
-    --container-id=abc123def456
+    --compose-file=docker-compose.yml
+
+  Salida esperada:
+
+  main: cargando módulo de kernel...
+  [kernel-loader] módulo cargado OK
+  main: módulo de kernel listo
+  main: iniciando contenedores (Grafana + Valkey)...
+  [compose] Container valkey_pr2  Started
+  [compose] Container grafana_pr2 Started
+  main: contenedores listos — Grafana en http://localhost:3000
+  main: daemon iniciado
+
+  Luego abre el browser en http://localhost:3000 (usuario: admin, contraseña: admin).
 
   ---
-  Resumen del flujo
+  Resumen del flujo completo
 
-  ┌────────────────────────┬────────────────────────────────────────────────────────────────┐
-  │          Paso          │                            Qué pasa                            │
-  ├────────────────────────┼────────────────────────────────────────────────────────────────┤
-  │ flag.Parse()           │ Lee los args --kernel-script y --container-id                  │
-  ├────────────────────────┼────────────────────────────────────────────────────────────────┤
-  │ kernel.Load()          │ Go llama al script con exec.Command                            │
-  ├────────────────────────┼────────────────────────────────────────────────────────────────┤
-  │ Script: lsmod          │ Verifica si ya está cargado → si sí, exit 0                    │
-  ├────────────────────────┼────────────────────────────────────────────────────────────────┤
-  │ Script: make           │ Compila el .ko solo si no existe                               │
-  ├────────────────────────┼────────────────────────────────────────────────────────────────┤
-  │ Script: insmod         │ Carga el módulo (con o sin container_id)                       │
-  ├────────────────────────┼────────────────────────────────────────────────────────────────┤
-  │ Script: verifica /proc │ Confirma que las entradas existen                              │
-  ├────────────────────────┼────────────────────────────────────────────────────────────────┤
-  │ svc.Run()              │ El daemon ya puede leer /proc/meminfo_... y /proc/continfo_... │
-  └────────────────────────┴────────────────────────────────────────────────────────────────┘
+  sudo ./daemon_pr2
+      │
+      ├── kernel.Load()     → insmod pr2_so1_201905884.ko
+      │                       crea /proc/meminfo_... y /proc/continfo_...
+      │
+      ├── compose.Up()      → docker compose up -d
+      │                       arranca valkey:6379 y grafana:3000
+      │
+      └── svc.Run()         → cada 5s:
+                                lee /proc → parsea → escribe JSONL
+                                pushToValkey() → Valkey
+                                                    ↑
+                                              Grafana lo lee
+                                              y lo visualiza
 
-  ¿Por cuál paso quieres empezar?
-
-✻ Baked for 35s
-
-  3 tasks (0 done, 1 in progress, 2 open)
-  ◼ Crear script de carga del módulo de kernel
-  ◻ Crear paquete kernel/loader.go en el daemon
-  ◻ Actualizar main.go para invocar el kernel loader
+  ¿En qué paso estás? Avísame cuando quieras continuar o si tienes alguna duda.
