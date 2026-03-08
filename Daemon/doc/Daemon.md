@@ -25,11 +25,13 @@ El daemon sigue un diseño de capas donde cada paquete tiene una unica responsab
 │                        KERNEL SPACE                             │
 │  /proc/meminfo_pr2_so1_201905884   → RAM_TOTAL_MB, FREE, USED  │
 │  /proc/continfo_pr2_so1_201905884  → PID, VSZ, RSS, MEM, CPU   │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │ polling cada 5s
-┌─────────────────────────▼───────────────────────────────────────┐
+└──────────────┬──────────────────────────────┬───────────────────┘
+               │ insmod (al inicio)            │ polling cada 5s
+┌──────────────▼──────────────────────────────▼───────────────────┐
 │                        USER SPACE (Go)                          │
 │                                                                 │
+│  kernel.Load()              → carga el .ko via script bash     │
+│          ↓                                                      │
 │  source.FileReader.Read()   → []byte (texto crudo)             │
 │          ↓                                                      │
 │  parser.ParseMemInfo()      → model.MemStats                   │
@@ -43,33 +45,109 @@ El daemon sigue un diseño de capas donde cada paquete tiene una unica responsab
 ## Estructura del Proyecto
 
 ```text
-Daemon/
-├── cmd/
-│   └── daemon/
-│       └── main.go          # entrada: senales OS + conecta piezas
-├── internal/
-│   ├── app/
-│   │   └── service.go       # orquestador: ticker + leer/parsear/escribir
-│   ├── model/
-│   │   └── metrics.go       # structs de dominio: MemStats, ContainerReport
-│   ├── parser/
-│   │   ├── meminfo.go       # texto crudo → MemStats
-│   │   └── continfo.go      # texto crudo → ContainerReport
-│   ├── sink/
-│   │   └── jsonfile.go      # struct → JSON Lines en archivo
-│   └── source/
-│       └── file_reader.go   # lee /proc con cancelacion por contexto
-├── doc/
-│   └── Daemon.md
-├── go.mod
-└── go.sum
+201905884_LAB_SO1_1S2026_PT2/
+├── scripts/
+│   └── load_kernel_module.sh          # compila e instala el .ko; verifica /proc
+├── Kernel/
+│   ├── pr2_so1_201905884.c
+│   └── Makefile
+└── Daemon/
+    ├── cmd/
+    │   └── daemon/
+    │       └── main.go                # entrada: flags + kernel.Load + senales OS
+    ├── internal/
+    │   ├── kernel/
+    │   │   └── loader.go              # ejecuta el script bash desde Go
+    │   ├── app/
+    │   │   └── service.go             # orquestador: ticker + leer/parsear/escribir
+    │   ├── model/
+    │   │   └── metrics.go             # structs de dominio: MemStats, ContainerReport
+    │   ├── parser/
+    │   │   ├── meminfo.go             # texto crudo → MemStats
+    │   │   └── continfo.go            # texto crudo → ContainerReport
+    │   ├── sink/
+    │   │   └── jsonfile.go            # struct → JSON Lines en archivo
+    │   └── source/
+    │       └── file_reader.go         # lee /proc con cancelacion por contexto
+    ├── doc/
+    │   └── Daemon.md
+    ├── go.mod
+    └── go.sum
 ```
 
 **Regla de capas:** `app/service.go` no sabe como se lee ni como se parsea. Solo orquesta quien llama a quien y cada cuanto tiempo.
 
 ## Componentes
 
-### 1. source — Lectura de archivos
+### 1. kernel — Carga del modulo
+
+Antes de que el daemon pueda leer `/proc`, el modulo de kernel debe estar insertado en el kernel en ejecucion. El paquete `kernel` encapsula esta responsabilidad.
+
+**Archivos involucrados:**
+
+- `scripts/load_kernel_module.sh` — script bash que realiza el trabajo real
+- `Daemon/internal/kernel/loader.go` — paquete Go que invoca el script
+
+#### scripts/load_kernel_module.sh
+
+El script tiene cinco responsabilidades en orden:
+
+| Paso | Comando | Que hace |
+|---|---|---|
+| 1 | `lsmod \| grep` | Si el modulo ya esta cargado, sale con exit 0 (idempotente) |
+| 2 | `[ ! -f .ko ]` + `make` | Compila el `.ko` solo si no existe todavia |
+| 3 | `insmod .ko [container_id=...]` | Inserta el modulo en el kernel; pasa el parametro opcional |
+| 4 | `[ -r /proc/... ]` | Verifica que ambas entradas `/proc` quedaron disponibles |
+| 5 | `echo OK` | Confirma exito; el daemon recibe esta linea en su log |
+
+Acepta un argumento opcional: el ID del contenedor Docker que el modulo usara para filtrar procesos via cgroup v2.
+
+```bash
+# Sin filtro de contenedor
+sudo ./scripts/load_kernel_module.sh
+
+# Con container ID
+sudo ./scripts/load_kernel_module.sh abc123def456
+```
+
+**Por que `set -euo pipefail`:**
+
+| Flag | Efecto |
+|---|---|
+| `-e` | Aborta si cualquier comando retorna codigo != 0 |
+| `-u` | Aborta si se usa una variable no definida |
+| `-o pipefail` | Propaga errores a traves de pipes (`cmd1 \| cmd2` falla si `cmd1` falla) |
+
+**Por que `BASH_SOURCE[0]` para calcular rutas:**
+Permite obtener la ruta absoluta del script sin importar desde que directorio se lo llame. `dirname` extrae la carpeta y `cd + pwd` la convierte en absoluta.
+
+#### Daemon/internal/kernel/loader.go
+
+```go
+type LoadOpts struct {
+    ScriptPath  string
+    ContainerID string
+}
+
+func Load(opts LoadOpts) error
+```
+
+**Flujo de `Load()`:**
+
+1. `os.Stat(opts.ScriptPath)` — verifica que el script existe antes de ejecutar; da un error claro si no.
+2. Construye `args := []string{ScriptPath}` y agrega `ContainerID` si no esta vacio.
+3. `exec.Command("/bin/bash", args...)` — invoca bash explicitamente, no depende del shebang.
+4. `CombinedOutput()` — ejecuta el script y captura stdout + stderr en un unico buffer; espera a que termine.
+5. Loguea cada linea de salida del script en el log del daemon.
+6. Si el script retorno codigo != 0, retorna `fmt.Errorf("kernel: script fallo: %w", err)`.
+
+**Por que `CombinedOutput()` en vez de `Output()`:**
+El script puede escribir errores en stderr (por ejemplo el mensaje de `insmod`). Con `CombinedOutput()` ambos streams llegan al log del daemon en el orden en que fueron escritos.
+
+**Por que `fmt.Errorf` con `%w`:**
+El `%w` envuelve el error original (`*exec.ExitError`). El caller puede inspeccionarlo con `errors.Is()` o `errors.As()` sin perder la informacion del error subyacente.
+
+### 2. source — Lectura de archivos
 
 Define la interfaz `Reader` y su implementacion `FileReader`.
 
@@ -111,7 +189,7 @@ PID    NAME              VSZ_(KB)   RSS_(KB)   %MEM_PCT   %CPU_RAW   CONTAINER_I
 CONTAINERS_ACTIVE=1
 ```
 
-### 2. model — Structs de dominio
+### 3. model — Structs de dominio
 
 Define las estructuras que representan los datos del sistema.
 
@@ -147,7 +225,7 @@ El kernel escribe estos valores con el formato `%llu` (unsigned long long). Nunc
 **Por que `Timestamp` en los structs:**
 Al serializar a JSON Lines, cada entrada queda marcada con la hora exacta de la lectura. Esto permite correlacionar datos de meminfo y continfo en el tiempo.
 
-### 3. parser — Texto a structs
+### 4. parser — Texto a structs
 
 Convierte los bytes crudos devueltos por `FileReader` en structs tipados.
 
@@ -203,7 +281,7 @@ Mapeo de columnas a campos del struct:
 | `parts[5]` | `CPURaw` | `strconv.ParseUint` |
 | `parts[6]` | `ContainerID` | string directo (puede ser `"-"`) |
 
-### 4. sink — Persistencia de datos
+### 5. sink — Persistencia de datos
 
 Define la interfaz `Writer` y su implementacion `JSONLineFile`.
 
@@ -233,7 +311,7 @@ type JSONLineFile struct {
 | Tolerancia a corrupcion | Cada linea es independiente | Un error rompe todo el archivo |
 | Memoria requerida | Constante | Proporcional al tamano total |
 
-### 5. app/service.go — Orquestador
+### 6. app/service.go — Orquestador
 
 Coordina las capas anteriores sin conocer sus detalles internos.
 
@@ -276,12 +354,25 @@ Read() ok? → Parse() ok? → Write()
    log + skip    log + skip
 ```
 
-### 6. cmd/daemon/main.go — Entrada
+### 7. cmd/daemon/main.go — Entrada
 
 Conecta todas las piezas y maneja las senales del OS.
 
 ```go
 func main() {
+    // Flags de linea de comandos
+    kernelScript := flag.String("kernel-script", "scripts/load_kernel_module.sh", "...")
+    containerID  := flag.String("container-id", "", "...")
+    flag.Parse()
+
+    // Cargar el modulo antes de arrancar el daemon
+    if err := kernel.Load(kernel.LoadOpts{
+        ScriptPath:  *kernelScript,
+        ContainerID: *containerID,
+    }); err != nil {
+        log.Fatalf("main: no se pudo cargar el modulo: %v", err)
+    }
+
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
@@ -310,6 +401,12 @@ func main() {
 }
 ```
 
+**Por que `kernel.Load()` va antes del contexto:**
+Si el modulo no carga, las entradas `/proc` no existen y el daemon no tiene fuentes de datos. Fallar rapido con `log.Fatalf` evita que el daemon arranque en un estado invalido.
+
+**Por que `flag.String()` retorna `*string`:**
+`flag.String()` retorna un puntero. El `*` en `*kernelScript` lo desreferencia para obtener el valor string. Esto permite que el paquete `flag` modifique la variable internamente al hacer `Parse()`.
+
 **Por que la goroutine para senales:**
 `<-sigChan` es una lectura bloqueante. Si estuviera en el hilo principal, el daemon nunca llegaria a `svc.Run()`. La goroutine espera la senal en paralelo mientras el daemon trabaja.
 
@@ -332,14 +429,25 @@ go build -o daemon_bin ./cmd/daemon
 ### 2. Ejecutar
 
 ```bash
-./daemon_bin
+# Sin filtro de contenedor (desde la raiz del proyecto)
+sudo ./Daemon/daemon_bin
+
+# Con container ID especifico
+sudo ./Daemon/daemon_bin --container-id=abc123def456
+
+# Con ruta explicita al script
+sudo ./Daemon/daemon_bin --kernel-script=/ruta/absoluta/scripts/load_kernel_module.sh
 ```
 
 Salida esperada en consola:
 
 ```text
-2026/03/01 10:00:00 main: daemon iniciado
-2026/03/01 10:00:05 main: daemon iniciado  ← primer tick a los 5s
+2026/03/01 10:00:00 main: cargando modulo de kernel...
+2026/03/01 10:00:00 [kernel-loader] compilando...
+2026/03/01 10:00:03 [kernel-loader] modulo cargado OK
+2026/03/01 10:00:03 main: modulo de kernel listo
+2026/03/01 10:00:03 main: daemon iniciado
+2026/03/01 10:00:08 main: daemon iniciado  ← primer tick a los 5s
 ```
 
 ### 3. Verificar salida en tiempo real
@@ -384,6 +492,15 @@ Salida al detener:
 
 | Elemento | Decision | Razon |
 |---|---|---|
+| Script bash separado | `scripts/load_kernel_module.sh` fuera del binario Go | El script puede ejecutarse independientemente para diagnosticar el modulo sin correr el daemon |
+| Paquete `kernel` en Go | `exec.Command("/bin/bash", script)` | Mantiene la logica de carga aislada; `main.go` no sabe como se carga el modulo |
+| `set -euo pipefail` en el script | Abortar ante cualquier fallo | Impide que `insmod` falle silenciosamente y el daemon arranque sin modulo |
+| Verificacion de `/proc` en el script | `[ -r /proc/... ]` al final | Prueba de aceptacion: confirma que el modulo ejecuto su `__init` correctamente |
+| `lsmod` al inicio del script | Salida con exit 0 si ya esta cargado | Hace el daemon idempotente: puede reiniciarse sin error aunque el modulo ya este activo |
+| `kernel.Load()` antes del contexto | `log.Fatalf` si falla | Falla rapido: no tiene sentido iniciar el daemon si las entradas `/proc` no estan disponibles |
+| `flag.String()` para configuracion | `--kernel-script` y `--container-id` | Evita rutas hardcodeadas; facilita despliegue en distintos entornos |
+| `CombinedOutput()` en Go | stdout + stderr del script en un buffer | Todas las lineas del script llegan al log del daemon en el orden correcto |
+| `fmt.Errorf` con `%w` | Wrapping del error original | El caller puede inspeccionar el error subyacente con `errors.Is()`/`errors.As()` |
 | Interfaz `Reader` | `source.Reader` en vez de `source.FileReader` | Permite intercambiar la fuente sin modificar el service |
 | Interfaz `Writer` | `sink.Writer` con `any` | Acepta tanto `MemStats` como `ContainerReport` con el mismo metodo |
 | `select` con dos canales | `ctx.Done()` y `ticker.C` | Responde a senales y al ticker sin bloquear |
@@ -397,7 +514,10 @@ Salida al detener:
 
 | Error | Causa | Solucion |
 |---|---|---|
-| `error al leer el archivo /proc/...` | Modulo del kernel no cargado | `sudo insmod pr2_so1_201905884.ko` |
+| `kernel: script no encontrado` | Ruta incorrecta en `--kernel-script` | Ejecutar desde la raiz del proyecto o pasar ruta absoluta |
+| `kernel: script fallo` | `insmod` rechazo el modulo | Ver el log completo; revisar `dmesg` para el error del kernel |
+| `ERROR: /proc/meminfo_... no existe` | El modulo cargo pero `__init` fallo | `dmesg \| tail -20` para ver el error del kernel |
+| `error al leer el archivo /proc/...` | Modulo del kernel no cargado | Verificar con `lsmod \| grep pr2` y reejecutar el daemon |
 | `open sink file /tmp/...: permission denied` | Sin permisos en `/tmp` | `chmod 777 /tmp` o cambiar la ruta de salida |
 | `RAM_TOTAL_MB cannot be zero` | Archivo `/proc` vacio o malformado | Verificar `cat /proc/meminfo_pr2_so1_201905884` |
 | Daemon no responde a `Ctrl+C` | Senal no capturada | Verificar que `signal.Notify` incluye `syscall.SIGINT` |
@@ -406,10 +526,20 @@ Salida al detener:
 
 ```bash
 # Compilar
+cd Daemon
 go build -o daemon_bin ./cmd/daemon
 
-# Ejecutar en primer plano
-./daemon_bin
+# Ejecutar (desde la raiz del proyecto, requiere sudo para insmod)
+sudo ./Daemon/daemon_bin
+
+# Ejecutar con container ID
+sudo ./Daemon/daemon_bin --container-id=abc123def456
+
+# Verificar que el modulo del kernel esta cargado
+lsmod | grep pr2_so1_201905884
+
+# Verificar que las entradas /proc existen
+ls /proc/ | grep pr2
 
 # Ver logs de memoria en tiempo real
 tail -f /tmp/meminfo.jsonl
@@ -417,11 +547,11 @@ tail -f /tmp/meminfo.jsonl
 # Ver logs de contenedores en tiempo real
 tail -f /tmp/continfo.jsonl
 
-# Verificar que el modulo del kernel esta cargado
-ls /proc/ | grep pr2
-
 # Ver ultimas 5 entradas de memoria formateadas
 tail -5 /tmp/meminfo.jsonl | python3 -m json.tool
+
+# Descargar el modulo manualmente
+sudo rmmod pr2_so1_201905884
 
 # Detener el daemon
 kill $(pgrep daemon_bin)
@@ -432,7 +562,7 @@ kill $(pgrep daemon_bin)
 | Aspecto | Descripcion |
 |---|---|
 | Lenguaje | Go |
-| Patron | Capas: source → parser → model → sink, orquestado por service |
+| Patron | Capas: kernel → source → parser → model → sink, orquestado por service |
 | Fuentes | `/proc/meminfo_pr2_so1_201905884` y `/proc/continfo_pr2_so1_201905884` |
 | Salida | `/tmp/meminfo.jsonl` y `/tmp/continfo.jsonl` (JSON Lines) |
 | Intervalo | 5 segundos (configurable en `main.go`) |

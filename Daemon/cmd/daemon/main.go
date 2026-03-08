@@ -13,6 +13,7 @@ package main
  */
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"daemon/internal/app"
+	"daemon/internal/kernel"
 	"daemon/internal/sink"
 	"daemon/internal/source"
 )
@@ -33,6 +35,42 @@ import (
 * Finalmente, se ejecuta el servicio y se maneja cualquier error que pueda ocurrir durante su ejecución.
  */
 func main() {
+
+	// Kernel script flag: permite especificar la ruta al script que carga el módulo del kernel, con un valor por defecto.
+	kernelScript := flag.String(
+		"kernel-script",
+		"scripts/load_kernel_module.sh",
+		"Ruta al script que carga el módulo de kernel",
+	)
+
+	// Container ID flag: permite especificar el ID del contenedor Docker, con un valor por defecto vacío.
+	containerID := flag.String(
+		"container-id",
+		"",
+		"ID del contenedor Docker",
+	)
+
+	// log para iniciar la carga del módulo del kernel
+	log.Println("main: cargando módulo de Kernel ...")
+
+	/*
+	* flag.String() retorna un *string (puntero).
+	* El * lo desreferencia para obtener el valor string
+	 */
+
+	// Si el módulo no carga, las entradas /proc no existen. No inicia el Daemon rerpota log.Fatalf.
+	if err := kernel.Load(kernel.LoadOpts{
+		ScriptPath:  *kernelScript,
+		ContainerID: *containerID,
+	}); err != nil {
+		log.Fatalf("main: error al cargar el módulo de kernel: %v", err)
+	}
+
+	log.Println("main: módulo de Kernel cargado exitosamente")
+
+	// Se parsean los flags para que estén disponibles en el programa.
+	flag.Parse()
+
 	// Se crea un contexto con cancelación para manejar la terminación del programa.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // Asegura que el contexto se cancele al finalizar main.
