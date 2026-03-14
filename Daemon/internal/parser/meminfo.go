@@ -8,9 +8,8 @@ package parser
 * model: para usar las estructuras definidas en el paquete model, como MemInfoData.
  */
 import (
+	"encoding/json"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	model "daemon/internal/model"
@@ -27,55 +26,19 @@ El archivo tiene este formato:
  *Recibe el texto crudo (lo que devolvió FileReader.Read()), retorna el struct listo o un error.
  */
 func ParseMemInfo(raw string) (model.MemStats, error) {
-	// Se inicializa una variable MemStats para almacenar los datos parseados.
-	var memStats model.MemStats
+	var report model.MemStats
+	var paserd model.MemStats
 
-	// Se divide el texto crudo en líneas usando strings.Split.
-	lines := strings.Split(raw, "\n")
-
-	// Para cada línea, se usa strings.SplitN(linea, "=", 2) — el 2 limita a máximo 2 partes, importante si algún valor pudiera contener =
-	for _, line := range lines {
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue // Si la línea no tiene el formato esperado, se ignora.
-		}
-
-		// Se aplica strings.TrimSpace a cada parte para eliminar espacios en blanco alrededor de la clave y el valor.
-		key := strings.TrimSpace(parts[0])
-		valueStr := strings.TrimSpace(parts[1])
-
-		// Switch sobre la clave, parsea cada valor con strconv.ParseUint(valor, 10, 64) y se asigna al campo correcto
-		switch key {
-		case "RAM_TOTAL_MB":
-			value, err := strconv.ParseUint(valueStr, 10, 64)
-			if err != nil {
-				return memStats, fmt.Errorf("error parsing RAM_TOTAL_MB: %w", err)
-			}
-			memStats.MemTotal = value
-		case "RAM_FREE_MB":
-			value, err := strconv.ParseUint(valueStr, 10, 64)
-			if err != nil {
-				return memStats, fmt.Errorf("error parsing RAM_FREE_MB: %w", err)
-			}
-			memStats.MemFree = value
-		case "RAM_USED_MB":
-			value, err := strconv.ParseUint(valueStr, 10, 64)
-			if err != nil {
-				return memStats, fmt.Errorf("error parsing RAM_USED_MB: %w", err)
-			}
-			memStats.MemUsed = value
-		}
+	// Deseriablizar el JSON directamente
+	if err := json.Unmarshal([]byte(raw), &paserd); err != nil {
+		return paserd, fmt.Errorf("error parsing JSON: %v", err)
 	}
 
-	// Se agrega un timestamp al struct, para registrar cuándo se obtuvieron los datos.
-	memStats.Timestamp = time.Now()
+	// Mapear los datos parseados a MemStats
+	report.MemTotal = paserd.MemTotal
+	report.MemFree = paserd.MemFree
+	report.MemUsed = paserd.MemUsed
+	report.Timestamp = time.Now() // Agregar un timestamp actual
 
-	// Valida que MemTotal != 0 para evitar divisiones por cero o datos inválidos.
-	if memStats.MemTotal == 0 {
-		return memStats, fmt.Errorf("RAM_TOTAL_MB cannot be zero")
-	}
-
-	// Se retorna el struct con los datos parseados o un error si ocurrió algún problema durante el proceso.
-	return memStats, nil
-
+	return report, nil
 }
