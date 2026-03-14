@@ -350,6 +350,7 @@ static int continfo_show(struct seq_file *m, void *v)
     struct sysinfo si; // Estructura para almacenar la información del sistema
     unsigned long mem_total_ram; // Variable para almacenar la memoria total del sistema en KB
     int containers_active = 0; // Contador para el número de procesos activos en el contenedor
+    char json_str [];
     char buf[512];
 
     si_meminfo(&si); // Obtener la información de memoria del sistema
@@ -362,19 +363,19 @@ static int continfo_show(struct seq_file *m, void *v)
     // Imprimir el encabezado del JSON para la lista de procesos
     snprintf(buf, sizeof(buf),
             "{\n"
-                "System Process Metrics: {\n"
-                "  \"total_ram_kb\": %lu,\n"
-                "  \"free_ram_kb\": %lu,\n"
-                "  \"used_ram_kb\": %lu\n"
-            "   }\n"
-            "}\n",
+                "\"system_process_metrics\": {\n"
+                "   \"total_ram_kb\": %lu,\n"
+                "   \"free_ram_kb\": %lu,\n"
+                "   \"used_ram_kb\": %lu\n"
+                " },\n",
             mem_total_ram, 
             si.freeram << (PAGE_SHIFT - 10), 
             (mem_total_ram - si.freeram * si.mem_unit / 1024)
         );
 
-    // Imprimir la información de memoria del sistema al principio de la salida
-    seq_printf(m, "%s", buf);
+    // Agregar a json_str para imprimir el encabezado del JSON para la lista de procesos
+    json_str [0] = '\0';
+    strncat(json_str, buf, sizeof(buf) - 1);
 
     /*
     * Se llama a rcu_read_lock() para proteger la sección de código que accede a la lista de procesos, 
@@ -420,7 +421,7 @@ static int continfo_show(struct seq_file *m, void *v)
             if (mm) {
                 vsz = mm->total_vm << (PAGE_SHIFT - 10); // Calcular el tamaño de la memoria virtual en KB
                 rss = get_mm_rss(mm) << (PAGE_SHIFT - 10); // Calcular el tamaño de la memoria residente en KB
-                mem_perc = (mem_total_ram > 0) ? (rss * 100) / mem_total_ram : 0; // Calcular el porcentaje de memoria utilizada por el proceso
+                mem_perc = (mem_total_ram > 0) ? (rss * 10000) / mem_total_ram : 0; // Calcular el porcentaje de memoria utilizada por el proceso
                 mmput(mm); // Liberar la estructura de memoria del proceso
             }
 
@@ -438,8 +439,7 @@ static int continfo_show(struct seq_file *m, void *v)
             
             // Impresion del Body del JSON con la información del proceso formateada
             snprintf(buf, sizeof(buf),
-                    "{\n"
-                        "System Process Docker: {\n"
+                    "\n \"system_process_docker\": {\n"
                         "  \"PID\": %d,\n"
                         "  \"Name\": \"%s\",\n"
                         "  \"Cmdline\": \"%s\",\n"
@@ -448,8 +448,7 @@ static int continfo_show(struct seq_file *m, void *v)
                         "  \"MemPerc\": %lu,\n"
                         "  \"CpuUsage\": %lu,\n"
                         "  \"ContainerId\": \"%s\"\n"
-                    "   }\n"
-                    "}\n",
+                    "     },\n",
                     task->pid,
                     task->comm,
                     cmdline ? cmdline : "",
@@ -460,7 +459,10 @@ static int continfo_show(struct seq_file *m, void *v)
                     container_id ? container_id : "-"
                 );
             
+            // Agregrar al str el Body del JSON con la información del proceso formateada
+            strlcat(json_str, buf, sizeof(json_str)); // Agregar el buffer formateado al json_str
             seq_printf(m, "%s", buf); // Imprimir la información del proceso en la salida del archivo proc
+
             kfree(cmdline);
             kfree(container_id);
             containers_active++;
@@ -475,13 +477,16 @@ static int continfo_show(struct seq_file *m, void *v)
 
     // Imprimir Pie del JSON con la información de contenedores activos
     snprintf(buf, sizeof(buf),
-        "{\n"
-            "Docker process Active: {\n"
-            "  \"# Dockers Processes\": %d\n"
+        "\n \"docker_process_Active\": {\n"
+            "  \"dockers_processes\": %d\n"
         "   }\n"
         "}\n",
         containers_active
     );
+
+    // Agregar al json_str el Pie del JSON con la información de contenedores activos
+    strlcat(json_str, buf, sizeof(json_str)); // Agregar el buffer formateado al json_str
+
     seq_printf(m, "%s", buf); 
 
     return 0; // Indicar que la función se ejecutó correctamente
