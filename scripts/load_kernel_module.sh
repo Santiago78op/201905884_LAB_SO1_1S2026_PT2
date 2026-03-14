@@ -41,12 +41,9 @@ if [ ! -f "${KO_FILE}" ]; then
 fi
 
 # 3. Cargar el módulo
-# insmod — carga el .ko en el kernel; si hay CONTAINER_ID, se lo pasa como parámetro al módulo
-if [ -n "${CONTAINER_ID}" ]; then
-    insmod "${KO_FILE}" container_id="${CONTAINER_ID}"
-else
-    insmod "${KO_FILE}"
-fi
+# insmod — carga el .ko en el kernel;
+sudo insmod "${KO_FILE}"
+
 
 # 4. Verificar que /proc fue creado
 # [ -r ... ] — verifica que las entradas /proc existen y son legibles; si no, el módulo falló al iniciarse
