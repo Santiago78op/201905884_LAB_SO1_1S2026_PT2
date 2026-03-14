@@ -85,6 +85,10 @@
  ? linux/jiffies.h
  * Se incluye para acceder a la variable jiffies, que se utiliza para calcular el tiempo 
  * de CPU acumulado por un proceso en la función continfo_show.
+
+ ? linux/mmap_lock.h
+ * Se incluye para acceder a la función mmap_read_lock, que se utiliza para proteger el acceso
+ * a la memoria de un proceso mientras se obtiene su información de memoria en la función continfo_show.
  */
 #include <linux/cgroup.h>       // cgroup_path
 #ifdef CONFIG_MEMCG
@@ -92,6 +96,7 @@
 #endif
 #include <linux/slab.h>         // kmalloc, kfree
 #include <linux/jiffies.h>     // jiffies
+#include <linux/mmap_lock.h>      // mmap_lock
 /* 
  * Definiciones de constantes para los nombres de las entradas en /proc, 
  * utilizando el número de carnet para personalizarlo.
@@ -107,7 +112,7 @@
  
  * CMDLINE se define como 256 para establecer la longitud del buffer.
 */
-#define CMDLINE 256,
+#define CMDLINE 256
 
 /*
  * El container_id muesta el identidicador del contenedor que esta
@@ -232,6 +237,91 @@ static const struct proc_ops meminfo_fops = {
 };
 
 /**
+ * @brief Get the process cmdline object    
+ * 
+ * @param task 
+ * @return char* 
+ */
+static char *get_process_cmdline(struct task_struct *task) {
+    struct mm_struct *mm = get_task_mm(task); // Obtener la estructura de memoria del proceso
+    char *cmdline;
+    unsigned long   arg_start = 0, 
+                    arg_end = 0,
+                    arg_len = 0;
+
+    if (!mm)
+        return NULL; // Si no se puede obtener la estructura de memoria, retornar NULL
+
+    cmdline = kmalloc(CMDLINE, GFP_KERNEL); // Asignar memoria para el buffer de cmdline
+    if (!cmdline) {
+        mmput(mm); // Liberar la estructura de memoria si no se pudo asignar el buffer
+        return NULL; // Retornar NULL si no se pudo asignar memoria
+    }
+
+    mmap_read_lock(mm); // Bloquear la memoria del proceso para lectura
+    arg_start = mm->arg_start; // Obtener el inicio de los argumentos del proceso
+    arg_end = mm->arg_end; // Obtener el final de los argumentos del proceso
+    mmap_read_unlock(mm); // Desbloquear la memoria del proceso
+
+    // Valida si arg_start y arg_end son válidos y si arg_end es mayor que arg_start para evitar lecturas inválidas
+    if(arg_start && arg_end > arg_start) {
+        int bytes_read;
+        int k;
+
+        arg_len = arg_end - arg_start;
+        if(arg_len > CMDLINE - 1){
+            arg_len = CMDLINE - 1; // Limitar la longitud de cmdline para evitar desbordamientos
+        }
+
+        bytes_read = access_process_vm(task, arg_start, cmdline, arg_len, 0); // Leer la línea de comandos del proceso
+
+        for(k = 0; k < bytes_read - 1; k++) {
+            if(cmdline[k] == '\0') {
+                cmdline[k] = ' '; // Reemplazar los caracteres nulos por espacios para mejorar la legibilidad
+            }
+        }
+
+        cmdline[bytes_read] = '\0'; // Asegurar que el buffer de cmdline esté terminado en nulo
+    }
+
+    mmput(mm); // Liberar la estructura de memoria del proceso
+    return cmdline; // Retornar el buffer de cmdline con la línea de comandos del proceso
+}
+
+/**
+ * @brief Get the container id object
+ * 
+ * @param task 
+ * @return char* 
+ */
+#ifdef CONFIG_MEMCG
+static char *get_container_id(struct task_struct *task) {
+    struct cgroup_subsys_state *css;
+    char *container_id, *p;
+
+    container_id = kmalloc(CONTAINER_ID, GFP_KERNEL);
+    if (!container_id)
+        return NULL;
+    container_id[0] = '\0';
+    css = task_get_css(task, memory_cgrp_id);
+    if (css) {
+        cgroup_path(css->cgroup, container_id, CONTAINER_ID);
+        css_put(css); // Liberar la referencia obtenida por task_get_css
+    }
+
+    // Extraer el container_id de la ruta del cgroup, asumiendo que el container_id es el último componente de la ruta
+    p = strstr(container_id, "docker-"); // Buscar el prefijo "docker-" en la ruta del cgroup
+    if (p){
+        p += strlen("docker-"); // Mover el puntero para apuntar al inicio del container_id después del prefijo
+        strscpy(container_id, p, 13); // Copiar el container_id al buffer de container_id
+        container_id[12] = '\0'; // Asegurar que el buffer de container_id esté terminado en nulo
+    }
+
+    return container_id;
+}
+#endif /* CONFIG_MEMCG */
+
+/**
  * Función para mostrar la información de los procesos en la entrada /proc/continfo_pr2_so1_201905884.
  * 
  * @param m: Puntero a la estructura seq_file utilizada para escribir la salida de la función.
@@ -255,19 +345,36 @@ static const struct proc_ops meminfo_fops = {
  */
 static int continfo_show(struct seq_file *m, void *v)
 {
-    struct task_struct *task; // Estructura para iterar sobre los procesos
-    struct sysinfo i; // Estructura para almacenar la información del sistema
-    unsigned long mem_total; // Variable para almacenar la memoria total en KB
+    // Variables sobre procesos y memoria
+    struct task_struct *task; // Puntero para iterar sobre los procesos
+    struct sysinfo si; // Estructura para almacenar la información del sistema
+    unsigned long mem_total_ram; // Variable para almacenar la memoria total del sistema en KB
     int containers_active = 0; // Contador para el número de procesos activos en el contenedor
+    char buf[512];
 
-    si_meminfo(&i); // Obtener la información de memoria del sistema
-    
-    mem_total = (i.totalram * i.mem_unit) / 1024; // Calcular la memoria total en KB
-    
-    if(!mem_total)
-    {
-        mem_total = 1; // Evitar división por cero, aunque esto no debería ocurrir en un sistema con memoria
+    si_meminfo(&si); // Obtener la información de memoria del sistema
+    mem_total_ram = (si.totalram * si.mem_unit) / 1024; //
+
+    if (!mem_total_ram) {
+        mem_total_ram = 1; // Evitar división por cero en caso de que la memoria total sea cero
     }
+
+    // Imprimir el encabezado del JSON para la lista de procesos
+    snprintf(buf, sizeof(buf),
+            "{\n"
+                "System Process Metrics: {\n"
+                "  \"total_ram_kb\": %lu,\n"
+                "  \"free_ram_kb\": %lu,\n"
+                "  \"used_ram_kb\": %lu\n"
+            "   }\n"
+            "}\n",
+            mem_total_ram, 
+            si.freeram << (PAGE_SHIFT - 10), 
+            (mem_total_ram - si.freeram * si.mem_unit / 1024)
+        );
+
+    // Imprimir la información de memoria del sistema al principio de la salida
+    seq_printf(m, "%s", buf);
 
     /*
     * Se llama a rcu_read_lock() para proteger la sección de código que accede a la lista de procesos, 
@@ -282,67 +389,100 @@ static int continfo_show(struct seq_file *m, void *v)
     */
     for_each_process(task) {
         bool include = is_general_process(task); // Variable para determinar si se debe incluir el proceso en la salida
-        bool in_cgroup = false; // Variable para determinar si el proceso está en el cgroup especificado por container_id
+        unsigned long total_jiffies = jiffies; // Variable para almacenar el tiempo de CPU acumulado por el proceso
+        char *cmdline = NULL; // Buffer para almacenar la línea de comandos del proceso
+        char *container_id = NULL; // Buffer para almacenar el container_id del proceso
 
         if(!include) {
             continue; // Si el proceso no se debe incluir, pasar al siguiente proceso
-        } 
+        }
 
         // * Metricas de memoria del proceso
         {
+            // Variables procesos relacionados con  procesos system, se restringe a solo procesos de Docker
             /*
-             * - get_task_mm() adquiere el lock interno y eleva el refcount atomicamente.
-             * - mmput() decrementa cuando se libera el mm_struct, lo que puede liberar la memoria si el refcount llega a cero.
-             * - Si el proceso no tiene espacio de memoria (kernel thread), retorna NULL y el bloque if no ejecuta.
+             * pid: Identificador el proceso
+             * name: nombre del proceso
+             * cmdline: línea de comandos con la que se ejecutó el proceso
+             * vsz: tamaño de la memoria virtual del proceso en KB
+             * rss: tamaño de la memoria residente del proceso en KB
+             * mem_perc: porcentaje de memoria utilizada por el proceso en relación con la memoria total del sistema
+             * cpu_ticks: tiempo de CPU acumulado por el proceso en jiffies (utime + stime)
+             * container_id: identificador del contenedor al que pertenece el proceso, si corresponde
             */
-            struct mm_struct *mm;
-            /*
-             * Varibales para almacenar en Kb:
 
-             * vsz: Almacena la longitud de memoria virtual
-             * rss: Almacena la longitud de memoria fisica
-             * mem_ptc: Almacena memoria utilizada
-             * cpu_raw: Almacena cpu utilizado
-            */
-            unsigned long vsz  = 0, 
-                          rss  = 0, 
-                          mem_pct = 0,
-                          cpu_raw = 0;
+            unsigned long   vsz = 0, 
+                            rss = 0,
+                            cpu_usage = 0;
+            unsigned long mem_perc = 0;
+            struct mm_struct *mm = get_task_mm(task); // Obtener la estructura de memoria del proceso
             
-            char cmdline[CMDLINE] = {0}; // Buffer para almacenar el cgroup path del proceso
-            char cid[128] // Buffer para almacenar el container_id
-
-            // Obtengo el cgroup path del proceso utilizando cgroup_path del proceso.
-            mm = get_task_mm(task);
-
-            // Valido si el proceso tiene un espacio de memoria.
             if (mm) {
-                vsz = mm->total_vm << (PAGE_SHIFT - 10);
-                rss = get_mm_rss(mm) << (PAGE_SHIFT - 10);
-                mmput(mm);
+                vsz = mm->total_vm << (PAGE_SHIFT - 10); // Calcular el tamaño de la memoria virtual en KB
+                rss = get_mm_rss(mm) << (PAGE_SHIFT - 10); // Calcular el tamaño de la memoria residente en KB
+                mem_perc = (mem_total_ram > 0) ? (rss * 100) / mem_total_ram : 0; // Calcular el porcentaje de memoria utilizada por el proceso
+                mmput(mm); // Liberar la estructura de memoria del proceso
             }
 
-            // Calculo el porcentaje de memoria utilizada por el proceso en relación con la memoria total del sistema.
-			mem_pct = (rss * 1000) / mem_total;
+            // Calcular el tiempo de CPU acumulado por el proceso en jiffies (utime + stime)
+            unsigned long total_time = task->utime + task->stime;
+            cpu_usage = (total_time > 0) ? (total_time * 10000) / total_jiffies : 0;
 
-            // Calculo el tiempo de CPU acumulado por el proceso (utime + stime).
-            cpu_raw = (task->utime + task->stime) * 1000;
+            // Asinacion del valor cmdline
+            cmdline = get_process_cmdline(task);
 
-            const char *cid_out = "-";
-            if (in_cgroup)
-                cid_out = container_id;
-         
+            // Asignacion del container_id
+#ifdef CONFIG_MEMCG
+            container_id = get_container_id(task);
+#endif
+            
+            // Impresion del Body del JSON con la información del proceso formateada
+            snprintf(buf, sizeof(buf),
+                    "{\n"
+                        "System Process Docker: {\n"
+                        "  \"PID\": %d,\n"
+                        "  \"Name\": \"%s\",\n"
+                        "  \"Cmdline\": \"%s\",\n"
+                        "  \"Vsz\": %lu,\n"
+                        "  \"Rss\": %lu,\n"
+                        "  \"MemPerc\": %lu,\n"
+                        "  \"CpuUsage\": %lu,\n"
+                        "  \"ContainerId\": \"%s\"\n"
+                    "   }\n"
+                    "}\n",
+                    task->pid,
+                    task->comm,
+                    cmdline ? cmdline : "",
+                    vsz,
+                    rss,
+                    mem_perc,
+                    cpu_usage,
+                    container_id ? container_id : "-"
+                );
+            
+            seq_printf(m, "%s", buf); // Imprimir la información del proceso en la salida del archivo proc
+            kfree(cmdline);
+            kfree(container_id);
+            containers_active++;
 		}
     }
-    
-    /* 
-    * Se llama a rcu_read_unlock() para liberar el bloqueo de lectura de RCU después de haber terminado de acceder a la lista de procesos. 
+
+    /*
+    * Se llama a rcu_read_unlock() para liberar el bloqueo de lectura de RCU después de haber terminado de acceder a la lista de procesos.
     * Esto permite que otros hilos o procesos puedan modificar la lista de procesos nuevamente.
     */
     rcu_read_unlock();
 
-    // Imprimir el número de procesos activos en el contenedor, que se cuenta durante la iteración sobre los procesos. Este valor se muestra al principio de la salida para indicar cuántos procesos relacionados con el contenedor están activos.
-    seq_printf(m, "CONTAINERS_ACTIVE=%d\n", containers_active); 
+    // Imprimir Pie del JSON con la información de contenedores activos
+    snprintf(buf, sizeof(buf),
+        "{\n"
+            "Docker process Active: {\n"
+            "  \"# Dockers Processes\": %d\n"
+        "   }\n"
+        "}\n",
+        containers_active
+    );
+    seq_printf(m, "%s", buf); 
 
     return 0; // Indicar que la función se ejecutó correctamente
 }
