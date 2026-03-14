@@ -81,13 +81,17 @@
  * Se incluye para acceder a la función task_get_css, que se utiliza para obtener el estado
  * del subsistema de cgroup de un proceso, aunque esta función puede no estar disponible 
  * en todos los kernels dependiendo de la configuración.
+  
+ ? linux/jiffies.h
+ * Se incluye para acceder a la variable jiffies, que se utiliza para calcular el tiempo 
+ * de CPU acumulado por un proceso en la función continfo_show.
  */
 #include <linux/cgroup.h>       // cgroup_path
 #ifdef CONFIG_MEMCG
 #include <linux/memcontrol.h>   // memory_cgrp_subsys_id
 #endif
 #include <linux/slab.h>         // kmalloc, kfree
-
+#include <linux/jiffies.h>     // jiffies
 /* 
  * Definiciones de constantes para los nombres de las entradas en /proc, 
  * utilizando el número de carnet para personalizarlo.
@@ -101,10 +105,15 @@
  * esta para identificar procesos específicos, especialmente en un entorno 
  * con contenedores Docker.
  
- * CGROUP_PATH_MAX se define como 512 para establecer un tamaño máximo para 
- * el buffer que se utilizará para almacenar el cgroup path de un proceso.
+ * CMDLINE se define como 256 para establecer la longitud del buffer.
 */
-#define CGROUP_PATH_MAX 512  // Tamaño máximo para cmdline
+#define CMDLINE 256,
+
+/*
+ * El container_id muesta el identidicador del contenedor que esta
+ * siendo ejecutado.
+*/
+#define CONTAINER_ID 64
 
 /* 
  * Declaración de punteros a las entradas del sistema de archivos proc 
@@ -146,92 +155,6 @@ static bool is_general_process(const struct task_struct *task)
 	       (strcmp(task->comm, "containerd-shim") == 0) ||
 	       (strcmp(task->comm, "containerd-shim-runc-v2") == 0) ||
 	       (strcmp(task->comm, "runc") == 0);
-}
-
-/*
- * Obtiene el cgroup v2 path del task (unified hierarchy) y verifica si contiene el CID.
- *
- * Implementación para cgroup v2:
- * - task_get_css(): obtiene css del task para el subsistema "unificado"
- * - cgroup_path(): convierte el cgroup a string path
- *
- ! NOTA:
- * Algunas funciones de cgroup pueden no estar exportadas para módulos dependiendo del build.
- * En kernels "generic" usualmente están disponibles.
- */
-
- /**
-  * @brief Función para verificar si un proceso pertenece a un contenedor 
-  * específico basado en su cgroup v2 path.
-  * 
-  * @param task 
-  * @param cid 
-  * @return true 
-  * @return false 
-  */
-static bool task_in_container_by_cgroup2(struct task_struct *task, const char *cid)
-{
-#ifdef CONFIG_MEMCG
-    char *path; // Buffer para almacenar el path del cgroup
-    struct cgroup_subsys_state *css = NULL; // Estructura para almacenar el estado del subsistema de cgroup
-    bool match = false; // Variable para indicar si el CID coincide con el path del cgroup
-
-    if(!cid || !*cid) {
-        return false; // Si el CID es nulo o vacío, no se puede determinar si el proceso está en un contenedor
-    }
-
-    /*
-    * Asignar memoria para el buffer del path utilizando kmalloc, que es una función del kernel para asignar memoria dinámica. 
-    * Se utiliza GFP_ATOMIC para indicar que la asignación se realiza en un contexto atómico (no bloqueante).
-    */
-    path = kmalloc(CGROUP_PATH_MAX, GFP_ATOMIC); 
-    if(!path) {
-        return false; // Si no se pudo asignar memoria para el buffer del path, no se puede determinar si el proceso está en un contenedor.
-    }
-
-    /*
-    * En cgroup v2, el "default hierarchy" se trata como subsistema unificado.
-    ? Usamos task_get_css() con &cgroup_subsys[0] NO es correcto/estable.
-    * La forma típica es usar task_get_css() para el subsistema "cpu"/"memory", etc.,
-    * Necesitamos cgroup del task en el árbol unificado. En kernels actuales,
-    * el css está asociado a un subsistema concreto; para obtener un path que incluya
-    * el nombre del cgroup del contenedor, escoger "memory" suele funcionar.
-    *
-    ! Nota:
-    * Si el kernel no tiene memory cgroup habilitado, hay que cambiar a "cpu" u otro.
-    */
-
-    /*
-    * Intentar obtener el css para el subsistema de memoria, que es comúnmente utilizado para identificar contenedores
-    * en cgroup v2. Si el kernel no tiene habilitado el subsistema de memoria, esta función puede no funcionar correctamente.
-    */    
-    css = task_get_css(task, memory_cgrp_id);
-
-
-    if (!css) {
-        kfree(path);
-        return false;
-    }
-
-    /*
-    * En kernels modernos (5.x+), cgroup_path() retorna 0 si tuvo éxito y un valor negativo (-errno) si falló. 
-    * El path típico en cgroup2 se ve como:
-    *   /system.slice/docker-<CID>.scope
-    * o /docker/<CID>...
-    */
-    if (cgroup_path(css->cgroup, path, CGROUP_PATH_MAX) == 0) {
-        if (strnstr(path, cid, CGROUP_PATH_MAX))
-            match = true;
-    }
-
-    css_put(css); // Liberar la referencia al css obtenida con task_get_css para evitar fugas de memoria
-    kfree(path);
-    return match; // Devolver true si el CID coincide con el path del cgroup, indicando que el proceso está en un contenedor, o false en caso contrario
-#else
-    (void)task;
-    (void)cid;
-    return false;
-#endif
 }
 
 /**
@@ -361,28 +284,9 @@ static int continfo_show(struct seq_file *m, void *v)
         bool include = is_general_process(task); // Variable para determinar si se debe incluir el proceso en la salida
         bool in_cgroup = false; // Variable para determinar si el proceso está en el cgroup especificado por container_id
 
-        /*
-         * Si se ha especificado un container_id, verificar si el proceso pertenece al cgroup correspondiente 
-         * utilizando task_in_container_by_cgroup2. 
-         
-         * Si el proceso pertenece al cgroup, se establece include en true para incluirlo en la salida.
-         
-         * Esto permite filtrar los procesos para mostrar solo aquellos que están relacionados con el contenedor 
-         * especificado por container_id.
-         
-         * Si no se ha especificado un container_id, solo se incluirán los procesos generales relacionados con Docker.
-        */
-        if(!include && container_id && *container_id) {
-            in_cgroup = task_in_container_by_cgroup2(task, container_id);
-            if(in_cgroup) {
-                include = true;
-                containers_active++; // Contar el número de procesos activos en el contenedor.
-            }
-        }
-
         if(!include) {
             continue; // Si el proceso no se debe incluir, pasar al siguiente proceso
-        }
+        } 
 
         // * Metricas de memoria del proceso
         {
@@ -392,28 +296,42 @@ static int continfo_show(struct seq_file *m, void *v)
              * - Si el proceso no tiene espacio de memoria (kernel thread), retorna NULL y el bloque if no ejecuta.
             */
             struct mm_struct *mm;
-            u64 vsz_kb = 0, rss_kb = 0, mem_pct = 0;
+            /*
+             * Varibales para almacenar en Kb:
 
+             * vsz: Almacena la longitud de memoria virtual
+             * rss: Almacena la longitud de memoria fisica
+             * mem_ptc: Almacena memoria utilizada
+             * cpu_raw: Almacena cpu utilizado
+            */
+            unsigned long vsz  = 0, 
+                          rss  = 0, 
+                          mem_pct = 0,
+                          cpu_raw = 0;
+            
+            char cmdline[CMDLINE] = {0}; // Buffer para almacenar el cgroup path del proceso
+            char cid[128] // Buffer para almacenar el container_id
+
+            // Obtengo el cgroup path del proceso utilizando cgroup_path del proceso.
             mm = get_task_mm(task);
+
+            // Valido si el proceso tiene un espacio de memoria.
             if (mm) {
-                vsz_kb = (u64)mm->total_vm << (PAGE_SHIFT - 10);
-                rss_kb = (u64)get_mm_rss(mm) << (PAGE_SHIFT - 10);
+                vsz = mm->total_vm << (PAGE_SHIFT - 10);
+                rss = get_mm_rss(mm) << (PAGE_SHIFT - 10);
                 mmput(mm);
             }
 
-			mem_pct = (rss_kb * 100) / mem_total_kb;
+            // Calculo el porcentaje de memoria utilizada por el proceso en relación con la memoria total del sistema.
+			mem_pct = (rss * 1000) / mem_total;
+
+            // Calculo el tiempo de CPU acumulado por el proceso (utime + stime).
+            cpu_raw = (task->utime + task->stime) * 1000;
 
             const char *cid_out = "-";
             if (in_cgroup)
                 cid_out = container_id;
-
-			seq_printf(m, "%d\t%s\t%llu\t%llu\t%llu\t%llu\t%s\n",
-                        task->pid, task->comm,
-                        (unsigned long long)vsz_kb,
-                        (unsigned long long)rss_kb,
-                        (unsigned long long)mem_pct,
-                        (unsigned long long)(task->utime + task->stime),
-                        cid_out);          
+         
 		}
     }
     
