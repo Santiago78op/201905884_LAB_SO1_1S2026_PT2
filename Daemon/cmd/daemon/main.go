@@ -39,7 +39,7 @@ func main() {
 	// Kernel script flag: permite especificar la ruta al script que carga el módulo del kernel, con un valor por defecto.
 	kernelScript := flag.String(
 		"kernel-script",
-		"~/Julian/201905884_LAB_SO1_1S2026_PT2/scripts/load_kernel_module.sh",
+		"/home/julian/Julian/201905884_LAB_SO1_1S2026_PT2/scripts/load_kernel_module.sh",
 		"Ruta al script que carga el módulo de kernel",
 	)
 
