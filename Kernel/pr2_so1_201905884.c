@@ -1,44 +1,66 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * PR2 SO1 - 201905884
- *
- * Basado en la documentacion oficial de Linux y el libro The Linux Kernel Module Programming Guide.
+
+ * Basado en la documentacion oficial de Linux y el libro 
+ * The Linux Kernel Module Programming Guide.
  * 
- * PROC: es un sistema de archivos virtual del kernel de Linux que proporciona una interfaz 
- * para acceder a información del sistema y procesos en tiempo real.
- * 
+ * PROC: es un sistema de archivos virtual del kernel de Linux que 
+ * proporciona una interfaz para acceder a información del sistema
+ * y procesos en tiempo real.
+
  * Se creo el PROC:
  *   /proc/meminfo_pr2_so1_201905884   -> Total/Free/Used RAM (KB)
  *   /proc/continfo_pr2_so1_201905884  -> Lista procesos con VSZ/RSS/%MEM/%CPU + cmdline
- *
+
  * Nota:
  * - El %CPU aquí se deja como "ticks" acumulados (puede ser grande).
- * - Para identificar contenedores Docker "del script", lo usual es filtrar por un marcador en cmdline.
+ * - Para identificar contenedores Docker "del script", 
+ * lo usual es filtrar por un marcador en cmdline.
  */
 
 /* 
- * El linux/module.h es necesario para crear un módulo de kernel en Linux. 
- * El linux/kernel.h se incluye para acceder a las funciones y macros del kernel de Linux.
- * El linux/init.h se utiliza para definir las funciones de inicialización y limpieza del módulo. 
+ ? linux/module.h 
+ * Es necesario para crear un módulo de kernel en Linux. 
+
+ ? linux/kernel.h 
+ * Se incluye para acceder a las funciones y macros del kernel de Linux.
+
+ ? linux/init.h 
+ * Se utiliza para definir las funciones de inicialización y limpieza del módulo. 
 */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 
 /*
- * El linux/proc_fs.h se incluye para trabajar con el sistema de archivos proc, que permite crear entradas virtuales 
- *                    para mostrar información del sistema.
- * El linux/seq_file.h se utiliza para facilitar la creación de archivos en proc que pueden mostrar información secuencial, como listas de procesos o estadísticas del sistema. 
+ ? linux/proc_fs.h 
+ * Se incluye para trabajar con el sistema de archivos proc, 
+ * que permite crear entradas virtuales para mostrar información del sistema.
+ 
+ ? linux/seq_file.h 
+ * Se utiliza para facilitar la creación de archivos en proc 
+ * que pueden mostrar información secuencial, como listas de procesos 
+ * o estadísticas del sistema. 
 */
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 
 /*
- * El linux/mmzone.h se incluye para acceder a la función si_meminfo, que proporciona información sobre la memoria del sistema.
- * El linux/mm.h se utiliza para trabajar con la memoria de los procesos, incluyendo funciones como get_mm_rss y 
- *               estructuras como mm_struct.
- * El linux/sched/signal.h se incluye para iterar sobre los procesos en el sistema utilizando for_each_process.
- * El linux/string.h se utiliza para funciones de manipulación de cadenas, como strscpy, que se utiliza para copiar cadenas de manera segura.
+ ? linux/mmzone.h 
+ * Se incluye para acceder a la función si_meminfo, 
+ * que proporciona información sobre la memoria del sistema.
+
+ ? El linux/mm.h 
+ * Se utiliza para trabajar con la memoria de los procesos, 
+ * incluyendo funciones como get_mm_rss y estructuras como mm_struct.
+ 
+ ? linux/sched/signal.h 
+ * Se incluye para iterar sobre los procesos en el sistema utilizando for_each_process.
+ 
+ ? El linux/string.h 
+ * Se utiliza para funciones de manipulación de cadenas, como strscpy, 
+ * que se utiliza para copiar cadenas de manera segura.
 */
 #include <linux/mmzone.h>        // si_meminfo
 #include <linux/mm.h>            // get_mm_rss, mm_struct
@@ -46,9 +68,19 @@
 #include <linux/string.h>        // strscpy
 
 /*
- * El linux/cgroup.h se utiliza para trabajar con cgroups, aunque en este módulo no se utiliza directamente, pero se incluye por si se necesita acceder a información relacionada con cgroups en el futuro.
- * El linux/slab.h se incluye para utilizar las funciones de asignación de memoria dinámica del kernel, como kmalloc y kfree, que se utilizan para gestionar la memoria del buffer de cmdline en la función continfo_show. 
- * El linux/memcontrol.h se incluye para acceder a la función task_get_css, que se utiliza para obtener el estado del subsistema de cgroup de un proceso, aunque esta función puede no estar disponible en todos los kernels dependiendo de la configuración.
+ ? linux/cgroup.h 
+ * Se utiliza para trabajar con cgroups, aunque en este módulo no se utiliza directamente, 
+ * pero se incluye por si se necesita acceder a información relacionada con cgroups en el futuro.
+
+ ? linux/slab.h 
+ * Se incluye para utilizar las funciones de asignación de memoria dinámica del kernel, 
+ * como kmalloc y kfree, que se utilizan para gestionar la memoria del buffer de 
+ * cmdline en la función continfo_show. 
+
+ ? linux/memcontrol.h 
+ * Se incluye para acceder a la función task_get_css, que se utiliza para obtener el estado
+ * del subsistema de cgroup de un proceso, aunque esta función puede no estar disponible 
+ * en todos los kernels dependiendo de la configuración.
  */
 #include <linux/cgroup.h>       // cgroup_path
 #ifdef CONFIG_MEMCG
@@ -56,41 +88,57 @@
 #endif
 #include <linux/slab.h>         // kmalloc, kfree
 
-// * Definiciones de constantes para los nombres de las entradas en /proc, utilizando el número de carnet para personalizarlo.
+/* 
+ * Definiciones de constantes para los nombres de las entradas en /proc, 
+ * utilizando el número de carnet para personalizarlo.
+ */
 #define CARNET "201905884"
 #define PROC_MEMINFO_NAME "meminfo_pr2_so1_" CARNET
 #define PROC_CONTINFO_NAME "continfo_pr2_so1_" CARNET
 
-// * La cmdline tiene como función mostrar la línea de comandos con la que se ejecutó cada proceso, lo cual es útil 
-// * para identificar procesos específicos, especialmente en un entorno con contenedores Docker.
+/* 
+ * La cmdline muestra la línea de comandos con la que se ejecutó cada proceso,
+ * esta para identificar procesos específicos, especialmente en un entorno 
+ * con contenedores Docker.
+ 
+ * CGROUP_PATH_MAX se define como 512 para establecer un tamaño máximo para 
+ * el buffer que se utilizará para almacenar el cgroup path de un proceso.
+*/
 #define CGROUP_PATH_MAX 512  // Tamaño máximo para cmdline
 
-// * Declaración de punteros a las entradas del sistema de archivos proc para meminfo y continfo, que se utilizarán 
-// * para crear y gestionar estas entradas en el módulo del kernel.
+/* 
+ * Declaración de punteros a las entradas del sistema de archivos proc 
+ * para meminfo y continfo, que se utilizarán para crear y gestionar 
+ * estas entradas en el módulo del kernel.
+*/
 static struct proc_dir_entry *proc_meminfo_entry;
 static struct proc_dir_entry *proc_continfo_entry;
 
 /*
  * Parámetro: container_id=<CID>
  * Se pueden pasar 12 chars o el CID completo.
- */
+ 
 static char *container_id;
 module_param(container_id, charp, 0444);
 MODULE_PARM_DESC(container_id, "Docker container ID substring used to match processes via cgroup v2 path");
+*/
 
 /**
- * Función para determinar si un proceso es un proceso "general" relacionado con Docker, como el demonio de Docker 
- * o los procesos de contenedores.
- * @param task: Puntero a la estructura task_struct del proceso que se desea evaluar.
- * @return: Devuelve true si el proceso es un proceso "general" relacionado con Docker y false en caso contrario.
+ * Función para determinar si un proceso es un proceso "general" relacionado con Docker, 
+ * como el demonio de Docker o los procesos de contenedores.
  * 
- * Esta función compara el nombre del proceso (task->comm) con una lista de nombres comunes de procesos relacionados con Docker, 
- * como "dockerd", "containerd", "containerd-shim", "containerd-shim-runc-v2" y "runc".
+ * @param task: Puntero a la estructura task_struct del proceso que se desea evaluar.
+ * @return: Devuelve true si el proceso es un proceso "general" relacionado con Docker 
+ * y false en caso contrario.
+ * 
+ * Esta función compara el nombre del proceso (task->comm) con una lista de nombres 
+ * comunes de procesos relacionados con Docker, como "dockerd", "containerd", 
+ * "containerd-shim", "containerd-shim-runc-v2" y "runc".
  */
 static bool is_general_process(const struct task_struct *task)
 {
 	/*
-	 * Dependen del proyecto, pero estos son los "generales".
+	 * Procesos "generales".
 	 * Estos suelen existir en hosts con Docker.
 	 */
 	return (strcmp(task->comm, "dockerd") == 0) ||
@@ -113,7 +161,8 @@ static bool is_general_process(const struct task_struct *task)
  */
 
  /**
-  * @brief Función para verificar si un proceso pertenece a un contenedor específico basado en su cgroup v2 path.
+  * @brief Función para verificar si un proceso pertenece a un contenedor 
+  * específico basado en su cgroup v2 path.
   * 
   * @param task 
   * @param cid 
@@ -187,53 +236,70 @@ static bool task_in_container_by_cgroup2(struct task_struct *task, const char *c
 
 /**
  * Función para mostrar la información de memoria en la entrada /proc/meminfo_pr2_so1_201905884.
- * @param m: Puntero a la estructura seq_file utilizada para escribir la salida de la función.
- * @param v: Puntero a un valor que se utiliza para iterar sobre la información secuencial, no se utiliza en esta función.
  * 
- * Esta función obtiene la información de memoria del sistema utilizando si_meminfo, calcula la memoria total, libre y 
- * usada en KB, y luego muestra esta información formateada en la salida del archivo proc.
+ * @param m: Puntero a la estructura seq_file utilizada para escribir la salida de la función.
+ * @param v: Puntero a un valor que se utiliza para iterar sobre la información 
+ * secuencial, no se utiliza en esta función.
+ * 
+ * Esta función obtiene la información de memoria del sistema utilizando si_meminfo,
+ * calcula la memoria total, libre y usada en KB, y luego muestra esta información 
+ * formateada en la salida del archivo proc.
+ * 
  * Se asegura de que la memoria usada no sea negativa y formatea la salida para que sea fácil de leer.
  */
 static int meminfo_show(struct seq_file *m, void *v)
 {
     struct sysinfo i; // Estructura para almacenar la información del sistema
-    u64 total_kb, free_kb, used_kb; // Variables para almacenar la memoria total, libre y usada en KB
+    unsigned long total_ram, 
+                  free_ram, 
+                  used_ram; // Variables para almacenar la memoria total, libre y usada en KB
+
+    char buf[256]; // Buffer para almacenar la salida formateada de la información de memoria
 
     si_meminfo(&i); // Obtener la información de memoria del sistema
 
-    total_kb = ((u64)i.totalram * (u64)i.mem_unit) / 1024; // Calcular la memoria total en KB
-    free_kb = ((u64)i.freeram * (u64)i.mem_unit) / 1024; // Calcular la memoria libre en KB
-    used_kb = (total_kb >= free_kb) ? (total_kb - free_kb) : 0; // Calcular la memoria usada en KB, asegurando que no sea negativa
+    total_ram = (i.totalram * i.mem_unit) / 1024; // Calcular la memoria total en KB
+    free_ram = (i.freeram * i.mem_unit) / 1024; // Calcular la memoria libre en KB
+    used_ram = (total_ram >= free_ram) ? (total_ram - free_ram) : 0; // Calcular la memoria usada en KB, asegurando que no sea negativa
+
+    //Crear Json con la información de memoria formateada
+    snprintf(buf, sizeof(buf),
+            "{\n"
+                "memory_info: {\n"
+                "  \"total_ram_kb\": %lu,\n"
+                "  \"free_ram_kb\": %lu,\n"
+                "  \"used_ram_kb\": %lu\n"
+            "   }\n"
+            "}\n",
+            total_ram, free_ram, used_ram);
     
-    // Mostrar la información de memoria en MB
-    /* En meminfo_show: */
-    seq_printf(m, "RAM_TOTAL_MB=%llu\n", (unsigned long long)(total_kb / 1024));
-    seq_printf(m, "RAM_FREE_MB=%llu\n",  (unsigned long long)(free_kb / 1024));
-    seq_printf(m, "RAM_USED_MB=%llu\n",  (unsigned long long)(used_kb / 1024));
+    seq_printf(m, "%s", buf); // Imprimir el buffer formateado en la salida del archivo proc
 
     return 0; // Indicar que la función se ejecutó correctamente
 }
 
 /**
  * Función para manejar la apertura del archivo proc para meminfo.
+ * 
  * @param inode: Puntero a la estructura inode del archivo proc que se está abriendo.
  * @param file: Puntero a la estructura file que representa el archivo proc que se está abriendo.
  * 
- * Esta función utiliza single_open para asociar la función meminfo_show con el archivo proc, lo que permite que
- * cada vez que se abra el archivo proc, se ejecute meminfo_show para mostrar la información de memoria actualizada. 
- * El tercer parámetro de single_open se deja como NULL ya que no se necesita pasar datos adicionales a meminfo_show.
+ * Esta función utiliza single_open para asociar la función meminfo_show con el archivo proc, 
+ * lo que permite que cada vez que se abra el archivo proc, se ejecute meminfo_show para 
+ * mostrar la información de memoria actualizada. 
+ * 
+ * El tercer parámetro de single_open se deja como NULL ya que no 
+ * se necesita pasar datos adicionales a meminfo_show.
  */
 static int meminfo_open(struct inode *inode, struct file *file)
 {
-    return single_open(file, meminfo_show, NULL); // Abrir el archivo proc utilizando single_open y asociar la función de mostrar
+    // Abrir el archivo proc utilizando single_open y asociar la función de mostrar
+    return single_open(file, meminfo_show, NULL);
 }
 
 /**
- * Estructura proc_ops para la entrada /proc/meminfo_pr2_so1_201905884, que define las operaciones que se pueden realizar en esta entrada del sistema de archivos proc.
- * - proc_open: Función para manejar la apertura del archivo proc, que se asigna a meminfo_open para mostrar la información de memoria cada vez que se abra el archivo.
- * - proc_read: Función para manejar la lectura del archivo proc, que se asigna a seq_read para permitir la lectura secuencial de la información mostrada por meminfo_show.
- * - proc_lseek: Función para manejar el desplazamiento en el archivo proc, que se asigna a seq_lseek para permitir el desplazamiento dentro del archivo proc al leerlo.
- * - proc_release: Función para manejar la liberación del archivo proc, que se asigna a single_release para liberar los recursos asociados con la apertura del archivo proc.    
+ * Estructura proc_ops para la entrada /proc/meminfo_pr2_so1_201905884, que define las operaciones 
+ * que se pueden realizar en esta entrada del sistema de archivos proc.
  */
 static const struct proc_ops meminfo_fops = {
     .proc_open = meminfo_open, // Función para manejar la apertura del archivo proc
@@ -244,30 +310,41 @@ static const struct proc_ops meminfo_fops = {
 
 /**
  * Función para mostrar la información de los procesos en la entrada /proc/continfo_pr2_so1_201905884.
+ * 
  * @param m: Puntero a la estructura seq_file utilizada para escribir la salida de la función.
  * @param v: Puntero a un valor que se utiliza para iterar sobre la información secuencial, no se utiliza en esta función.
  * 
- * Esta función itera sobre todos los procesos en el sistema utilizando for_each_process, y para cada proceso, verifica si es un proceso "general" relacionado con Docker o si coincide con el container_id especificado en su cgroup v2 path.
- * Si el proceso cumple con los criterios de inclusión, se obtiene su información de memoria (VSZ y RSS), se calcula el porcentaje de memoria utilizada en relación con la memoria total del sistema, y se muestra esta información formateada en la salida del archivo proc.
- * La salida incluye el PID, el nombre del proceso, la memoria virtual (VSZ), la memoria residente (RSS), el porcentaje de memoria utilizada, el tiempo de CPU acumulado (utime + stime) y el container_id si corresponde.
+ * Esta función itera sobre todos los procesos en el sistema utilizando for_each_process,
+ * y para cada proceso, verifica si es un proceso "general" relacionado con Docker o 
+ * si coincide con el container_id especificado en su cgroup v2 path.
+ * 
+ * Si el proceso cumple, se obtiene su información de memoria (VSZ y RSS), se calcula el 
+ * porcentaje de memoria utilizada en relación con la memoria total del sistema, 
+ * y se muestra esta información formateada en la salida del archivo proc.
+ * 
+ * La salida incluye el PID, el nombre del proceso, la memoria virtual (VSZ), 
+ * la memoria residente (RSS), el porcentaje de memoria utilizada, 
+ * el tiempo de CPU acumulado (utime + stime) y el container_id si corresponde.
+ * 
+ * Se agrega el cmdline para identificar procesos específicos, relacionados con
+ * entorno con contenedores Docker, se cuenta el número de procesos activos 
+ * en el contenedor para mostrarlo al final de la salida.
  */
 static int continfo_show(struct seq_file *m, void *v)
 {
     struct task_struct *task; // Estructura para iterar sobre los procesos
     struct sysinfo i; // Estructura para almacenar la información del sistema
-    u64 mem_total_kb; // Variable para almacenar la memoria total en KB
+    unsigned long mem_total; // Variable para almacenar la memoria total en KB
     int containers_active = 0; // Contador para el número de procesos activos en el contenedor
 
     si_meminfo(&i); // Obtener la información de memoria del sistema
-    mem_total_kb = ((u64)i.totalram * (u64)i.mem_unit) / 1024; // Calcular la memoria total en KB
     
-    if(!mem_total_kb)
+    mem_total = (i.totalram * i.mem_unit) / 1024; // Calcular la memoria total en KB
+    
+    if(!mem_total)
     {
-        mem_total_kb = 1; // Evitar división por cero, aunque esto no debería ocurrir en un sistema con memoria
+        mem_total = 1; // Evitar división por cero, aunque esto no debería ocurrir en un sistema con memoria
     }
-
-    seq_printf(m, "container_id=%s\n", container_id ? container_id : "(none)"); // Imprimir el container_id que se está utilizando para filtrar los procesos, o "(none)" si no se ha especificado un container_id
-    seq_printf(m, "PID\tNAME\tVSZ_(KB)\tRSS_(KB)\t%%MEM_PCT\t%%CPU_RAW\tCONTAINER_ID\n"); // Imprimir encabezado de la tabla
 
     /*
     * Se llama a rcu_read_lock() para proteger la sección de código que accede a la lista de procesos, 
@@ -276,19 +353,23 @@ static int continfo_show(struct seq_file *m, void *v)
     */
     rcu_read_lock();
     
-    // Iterar sobre todos los procesos en el sistema utilizando for_each_process, que es una macro que permite recorrer la lista de procesos.
+    /*
+    * Iterar sobre todos los procesos en el sistema utilizando for_each_process, 
+    * que es una macro que permite recorrer la lista de procesos.
+    */
     for_each_process(task) {
-        bool include = false; // Variable para determinar si se debe incluir el proceso en la salida
+        bool include = is_general_process(task); // Variable para determinar si se debe incluir el proceso en la salida
         bool in_cgroup = false; // Variable para determinar si el proceso está en el cgroup especificado por container_id
 
-        if(is_general_process(task)) {
-            include = true; // Incluir procesos generales relacionados con Docker
-        }
-
         /*
-         * Si se ha especificado un container_id, verificar si el proceso pertenece al cgroup correspondiente utilizando task_in_container_by_cgroup2. 
+         * Si se ha especificado un container_id, verificar si el proceso pertenece al cgroup correspondiente 
+         * utilizando task_in_container_by_cgroup2. 
+         
          * Si el proceso pertenece al cgroup, se establece include en true para incluirlo en la salida.
-         * Esto permite filtrar los procesos para mostrar solo aquellos que están relacionados con el contenedor especificado por container_id.
+         
+         * Esto permite filtrar los procesos para mostrar solo aquellos que están relacionados con el contenedor 
+         * especificado por container_id.
+         
          * Si no se ha especificado un container_id, solo se incluirán los procesos generales relacionados con Docker.
         */
         if(!include && container_id && *container_id) {
@@ -350,12 +431,16 @@ static int continfo_show(struct seq_file *m, void *v)
 
 /**
  * Función para manejar la apertura del archivo proc para continfo.
+ * 
  * @param inode: Puntero a la estructura inode del archivo proc que se está abriendo.
  * @param file: Puntero a la estructura file que representa el archivo proc que se está abriendo.
  * 
- * Esta función utiliza single_open para asociar la función continfo_show con el archivo proc, lo que permite que
- * cada vez que se abra el archivo proc, se ejecute continfo_show para mostrar la información de los procesos actualizada. 
- * El tercer parámetro de single_open se deja como NULL ya que no se necesita pasar datos adicionales a continfo_show.
+ * Esta función utiliza single_open para asociar la función continfo_show con el archivo proc, 
+ * lo que permite que cada vez que se abra el archivo proc, se ejecute continfo_show para 
+ * mostrar la información de los procesos actualizada. 
+ * 
+ * El tercer parámetro de single_open se deja como NULL ya que no 
+ * se necesita pasar datos adicionales a continfo_show.
  */
 static int continfo_open(struct inode *inode, struct file *file)
 {
@@ -363,26 +448,30 @@ static int continfo_open(struct inode *inode, struct file *file)
 }
 
 /**
- * Estructura proc_ops para la entrada /proc/continfo_pr2_so1_201905884, que define las operaciones que se pueden realizar en esta entrada del sistema de archivos proc.
- * - proc_open: Función para manejar la apertura del archivo proc, que se asigna a continfo_open para mostrar la información de los procesos cada vez que se abra el archivo.
- * - proc_read: Función para manejar la lectura del archivo proc, que se asigna a seq_read para permitir la lectura secuencial de la información mostrada por continfo_show.
- * - proc_lseek: Función para manejar el desplazamiento en el archivo proc, que se asigna a seq_lseek para permitir el desplazamiento dentro del archivo proc al leerlo.
- * - proc_release: Función para manejar la liberación del archivo proc, que se asigna a single_release para liberar los recursos asociados con la apertura del archivo proc.        
+ * Estructura proc_ops para la entrada /proc/continfo_pr2_so1_201905884, que define las operaciones
+ * que se pueden realizar en esta entrada del sistema de archivos proc. 
  */
 static const struct proc_ops continfo_ops = {
-	.proc_open    = continfo_open,
-	.proc_read    = seq_read,
-	.proc_lseek   = seq_lseek,
-	.proc_release = single_release,
+	.proc_open    = continfo_open, // Función para manejar la apertura del archivo proc
+	.proc_read    = seq_read, // Función para manejar la lectura del archivo proc utilizando seq_read
+	.proc_lseek   = seq_lseek, // Función para manejar el desplazamiento en el archivo proc utilizando seq_lseek
+	.proc_release = single_release, // Función para manejar la liberación del archivo proc utilizando single_release
 };
 
 /**
  * Función de inicialización del módulo, que se ejecuta cuando el módulo es cargado en el kernel.
- * Esta función crea las entradas en el sistema de archivos proc para meminfo y continfo utilizando proc_create, y luego imprime un 
- * mensaje de información en el log del kernel indicando que las entradas han sido creadas exitosamente.
- * Si la creación de alguna de las entradas falla, se limpian las entradas creadas previamente y se devuelve un error de memoria (-ENOMEM).
- * Además, se verifica si el parámetro container_id ha sido especificado y se imprime una advertencia si no lo ha sido, indicando
- *  que solo se listarán procesos generales. También se verifica si la configuración CONFIG_MEMCG está habilitada y se imprime 
+ * 
+ * Esta función crea las entradas en el sistema de archivos proc para meminfo y continfo 
+ * utilizando proc_create, y luego imprime un mensaje de información en el log del kernel 
+ * indicando que las entradas han sido creadas exitosamente.
+ * 
+ * Si la creación de alguna de las entradas falla, se limpian las entradas creadas previamente 
+ * y se devuelve un error de memoria (-ENOMEM).
+ * 
+ * Además, se verifica si el parámetro container_id ha sido especificado y se imprime 
+ * una advertencia si no lo ha sido, indicando que solo se listarán procesos generales. 
+ * 
+ * También se verifica si la configuración CONFIG_MEMCG está habilitada y se imprime 
  * una advertencia si no lo está, indicando que no se podrán filtrar procesos por cgroup (solo generales).   
  */
 static int __init pr2_module_init(void)
@@ -400,8 +489,10 @@ static int __init pr2_module_init(void)
 	pr_info("PR2 SO1 %s: /proc/%s y /proc/%s creados\n",
 		CARNET, PROC_MEMINFO_NAME, PROC_CONTINFO_NAME);
 
+    /*
 	if (!container_id || !*container_id)
 		pr_warn("PR2 SO1 %s: container_id no especificado; solo se listaran procesos generales\n", CARNET);
+    */
 
 #ifndef CONFIG_MEMCG
 	pr_warn("PR2 SO1 %s: CONFIG_MEMCG deshabilitado; no se podran filtrar procesos por cgroup (solo generales)\n", CARNET);
@@ -412,10 +503,17 @@ static int __init pr2_module_init(void)
 
 /**
  * Función de limpieza del módulo, que se ejecuta cuando el módulo es descargado del kernel.
+ * 
  * Esta función elimina las entradas en el sistema de archivos proc para meminfo y continfo si
- * existen, y luego imprime un mensaje de información en el log del kernel indicando que el módulo ha sido descargado.   
- * Si las entradas existen, se eliminan utilizando proc_remove, que es una función del kernel para eliminar entradas del sistema de archivos proc.
- * Después de eliminar las entradas, se imprime un mensaje de información utilizando pr_info para indicar que el módulo ha sido descargado exitosamente.   
+ * existen, y luego imprime un mensaje de información en el log del kernel indicando
+ * que el módulo ha sido descargado. 
+ *   
+ * Si las entradas existen, se eliminan utilizando proc_remove, que es una función del kernel
+ * para eliminar entradas del sistema de archivos proc.
+ * 
+ * Después de eliminar las entradas, se imprime un mensaje de información utilizando pr_info 
+ * para indicar que el módulo ha sido descargado exitosamente.   
+ * 
  * El mensaje incluye el número de carnet para identificar el módulo específico que ha sido descargado.
  */
 static void __exit pr2_module_exit(void)
@@ -428,22 +526,31 @@ static void __exit pr2_module_exit(void)
 	pr_info("PR2 SO1 %s: modulo descargado\n", CARNET);
 }
 
-/**
- * Las macros module_init y module_exit se utilizan para registrar las funciones de inicialización y limpieza del módulo, respectivamente.
+/*
+ * Las macros module_init y module_exit se utilizan para registrar 
+ * las funciones de inicialización y limpieza del módulo.
+
  * - module_init(pr2_module_init): Registra la función pr2_module_init como la
- * función de inicialización del módulo, que se ejecutará cuando el módulo sea cargado en el kernel.
+ * función de inicialización del módulo, que se ejecutará cuando el módulo 
+ * sea cargado en el kernel.
+ 
  * - module_exit(pr2_module_exit): Registra la función pr2_module_exit como la
- *  función de limpieza del módulo, que se ejecutará cuando el módulo sea descargado del kernel.
- * Estas macros son esenciales para que el kernel sepa qué funciones ejecutar en los momentos adecuados durante el ciclo de vida del módulo.
+ *  función de limpieza del módulo, que se ejecutará cuando el módulo 
+ * sea descargado "Eliminado" del kernel.
+ * 
  */
 module_init(pr2_module_init);
 module_exit(pr2_module_exit);
 
-/**
- * Las macros MODULE_LICENSE, MODULE_AUTHOR y MODULE_DESCRIPTION se utilizan para proporcionar información sobre el módulo.
- * - MODULE_LICENSE("GPL"): Indica que el módulo está licenciado bajo la Licencia Pública General de GNU (GPL), lo que permite su uso y distribución bajo los términos de esta licencia.
- * - MODULE_AUTHOR("201905884"): Proporciona el nombre del autor del módulo, en este caso, se utiliza el número de carnet para identificar al autor.
- * - MODULE_DESCRIPTION("Modulo PR2 SO1: meminfo + continfo en /proc"): Proporciona una descripción breve del módulo, indicando que se trata de un módulo para el PR2 de Sistemas Operativos 1 que crea entradas en /proc para mostrar información de memoria y procesos.   
+/*
+ * Las macros MODULE_LICENSE, MODULE_AUTHOR y MODULE_DESCRIPTION información sobre el módulo.
+
+ * - MODULE_LICENSE("GPL"): Indica que el módulo está licenciado bajo la Licencia 
+ * Pública General de GNU (GPL), lo que permite su uso y distribución bajo los términos de esta licencia.
+
+ * - MODULE_AUTHOR("201905884"): Proporciona el nombre del autor del módulo.
+
+ * - MODULE_DESCRIPTION("Modulo PR2 SO1: meminfo + continfo en /proc"): Proporciona una descripción breve del módulo.
  */
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("201905884");
