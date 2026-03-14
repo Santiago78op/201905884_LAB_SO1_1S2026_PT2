@@ -13,14 +13,13 @@ import "time"
 * Nunca serán negativos.
  */
 type MemStats struct {
-	MemTotal  uint64
-	MemFree   uint64
-	MemUsed   uint64
-	Timestamp time.Time
+	MemTotal  uint64    `json:"total_ram_kb"`
+	MemFree   uint64    `json:"free_ram_kb"`
+	MemUsed   uint64    `json:"used_ram_kb"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 /*
-*
   - continfo_pr2_so1_201905884
   - ProcessInfo es una estructura que representa la información de un proceso. Contiene los siguientes campos:
   - - Pid: el identificador del proceso.
@@ -33,30 +32,24 @@ type MemStats struct {
     Si el proceso no pertenece a ningún contenedor, este campo puede estar vacío o contener un valor predeterminado.
 */
 type ProcessInfo struct {
-	Pid         int
-	Name        string
-	VSZkb       uint64
-	RSSkb       uint64
-	MemPct      uint64
-	CPURaw      uint64
-	ContainerID string
+	Pid         int    `json:"pid"`
+	Name        string `json:"name"`
+	Cmdline     string `json:"cmdline"`
+	VSZkb       uint64 `json:"vsz_kb"`
+	RSSkb       uint64 `json:"rss_kb"`
+	MemPct      uint64 `json:"mem_perc_x100"`
+	CPURaw      uint64 `json:"cpu_perc_x100"`
+	ContainerID string `json:"container_id"`
 }
 
-/*
-*
-  - !Nota: Esto es importante: el parser va a leer el archivo de arriba hacia abajo y necesita un lugar donde acumular los procesos mientras
-  - !lee línea por línea. ContainerReport es ese lugar.
-  - ContainerReport es una estructura que representa un informe de contenedor. Contiene los siguientes campos:
-  - - FilterID: un identificador que se utiliza para filtrar los procesos que pertenecen a un contenedor específico.
-  - - Processes: un slice de ProcessInfo que contiene la información de los procesos que pertenecen al contenedor identificado por FilterID.
-  - - ContainersActive: un contador que indica la cantidad de contenedores activos en el sistema.
-  - - Timestamp: la marca de tiempo que indica cuándo se recopiló este informe de contenedor.
-    Este campo se puede utilizar para monitorear el estado general del sistema y
-    detectar posibles problemas relacionados con la cantidad de contenedores en ejecución.
-*/
 type ContainerReport struct {
 	FilterID         string
 	Processes        []ProcessInfo
 	ContainersActive int
 	Timestamp        time.Time
+}
+
+type JsonContInfo struct {
+	Processes    []ProcessInfo `json:"processes"`
+	DockerActive int           `json:"docker_active"`
 }
