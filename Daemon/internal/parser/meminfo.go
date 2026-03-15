@@ -26,19 +26,20 @@ El archivo tiene este formato:
  *Recibe el texto crudo (lo que devolvió FileReader.Read()), retorna el struct listo o un error.
  */
 func ParseMemInfo(raw string) (model.MemStats, error) {
-	var report model.MemStats
-	var paserd model.MemStats
+	var parsed model.JsonMemInfo
 
-	// Deseriablizar el JSON directamente
-	if err := json.Unmarshal([]byte(raw), &paserd); err != nil {
-		return paserd, fmt.Errorf("error parsing JSON: %v", err)
+	// Deserializar el JSON directamente
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return model.MemStats{}, fmt.Errorf("error parsing JSON: %v", err)
 	}
 
 	// Mapear los datos parseados a MemStats
-	report.MemTotal = paserd.MemTotal
-	report.MemFree = paserd.MemFree
-	report.MemUsed = paserd.MemUsed
-	report.Timestamp = time.Now() // Agregar un timestamp actual
+	memStats := model.MemStats{
+		MemTotal:  parsed.MemTotal,
+		MemFree:   parsed.MemFree,
+		MemUsed:   parsed.MemUsed,
+		Timestamp: time.Now(), // Agregar un timestamp actual
+	}
 
-	return report, nil
+	return memStats, nil
 }

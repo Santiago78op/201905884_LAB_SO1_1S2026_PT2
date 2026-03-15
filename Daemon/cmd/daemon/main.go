@@ -110,7 +110,8 @@ func main() {
 			- SIGTERM → la que manda systemd, kill <pid>, o Docker al detener un contenedor
 			- SIGINT → la que produce Ctrl+C en terminal
 
-			Cuando llega cualquiera de las dos, se llama cancel(), lo que hace que ctx.Done() se cierre, lo que hace que service.Run() retorne nil limpiamente.
+			Cuando llega cualquiera de las dos, se llama cancel(), lo que hace que ctx.Done() se cierre,
+			lo que hace que service.Run() retorne nil limpiamente.
 	*/
 	// Captura de señales del Os para permitir una terminación limpia.
 	sigChan := make(chan os.Signal, 1)

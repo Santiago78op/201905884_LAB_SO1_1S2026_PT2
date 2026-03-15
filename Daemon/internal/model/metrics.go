@@ -53,3 +53,9 @@ type JsonContInfo struct {
 	Processes    []ProcessInfo `json:"processes"`
 	DockerActive int           `json:"docker_active"`
 }
+
+type JsonMemInfo struct {
+	MemTotal uint64 `json:"total_ram_kb"`
+	MemFree  uint64 `json:"free_ram_kb"`
+	MemUsed  uint64 `json:"used_ram_kb"`
+}
