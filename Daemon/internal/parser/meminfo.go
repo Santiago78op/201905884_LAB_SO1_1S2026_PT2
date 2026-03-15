@@ -25,20 +25,25 @@ El archivo tiene este formato:
 /*
  *Recibe el texto crudo (lo que devolvió FileReader.Read()), retorna el struct listo o un error.
  */
-func ParseMemInfo(raw string) (model.MemStats, error) {
-	var parsed model.JsonMemInfo
+// wrapper coincide con el JSON anidado que emite el módulo de kernel:
+// { "memory_info": { "total_ram_kb": X, "free_ram_kb": Y, "used_ram_kb": Z } }
+type kernelMemInfoWrapper struct {
+	MemoryInfo model.JsonMemInfo `json:"memory_info"`
+}
 
-	// Deserializar el JSON directamente
-	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+func ParseMemInfo(raw string) (model.MemStats, error) {
+	var wrapper kernelMemInfoWrapper
+
+	if err := json.Unmarshal([]byte(raw), &wrapper); err != nil {
 		return model.MemStats{}, fmt.Errorf("error parsing JSON: %v", err)
 	}
 
-	// Mapear los datos parseados a MemStats
+	parsed := wrapper.MemoryInfo
 	memStats := model.MemStats{
 		MemTotal:  parsed.MemTotal,
 		MemFree:   parsed.MemFree,
 		MemUsed:   parsed.MemUsed,
-		Timestamp: time.Now(), // Agregar un timestamp actual
+		Timestamp: time.Now(),
 	}
 
 	return memStats, nil
