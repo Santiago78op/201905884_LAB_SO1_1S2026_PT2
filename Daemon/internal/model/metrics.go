@@ -55,10 +55,10 @@ tick N:    ContainersActive = 3
 - ContainersInactive int — acumulado total de eliminados desde que inició el daemon
 */
 type ContainerReport struct {
-	FilterID           string        `json:"filter_id"`
-	Processes          []ProcessInfo `json:"processes"`
+	FilterID           string        `json:"-"`        // no necesario en Grafana
+	Processes          []ProcessInfo `json:"-"`        // se guarda por separado en procinfo
 	ContainersActive   int           `json:"containers_active"`
-	ContainersExited   int           `json:"containers_exited"`   // terminaron solos (ej: sleep 240)
+	ContainersExited   int           `json:"containers_exited"`
 	ContainersRemoved  int           `json:"containers_removed"`
 	ContainersInactive int           `json:"containers_inactive"`
 	Timestamp          time.Time     `json:"timestamp"`
