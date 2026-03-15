@@ -58,6 +58,7 @@ type ContainerReport struct {
 	FilterID           string        `json:"filter_id"`
 	Processes          []ProcessInfo `json:"processes"`
 	ContainersActive   int           `json:"containers_active"`
+	ContainersExited   int           `json:"containers_exited"`   // terminaron solos (ej: sleep 240)
 	ContainersRemoved  int           `json:"containers_removed"`
 	ContainersInactive int           `json:"containers_inactive"`
 	Timestamp          time.Time     `json:"timestamp"`

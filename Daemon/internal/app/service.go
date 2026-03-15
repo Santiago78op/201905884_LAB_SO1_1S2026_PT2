@@ -103,6 +103,7 @@ func (s *Service) tick(ctx context.Context) {
 				cont.ContainersRemoved = result.Removed
 				cont.ContainersInactive = s.totalContainersRemoved
 				cont.ContainersActive = result.ActiveLow + result.ActiveHigh
+				cont.ContainersExited = result.Exited
 			}
 
 			if err := s.ContWriter.Write(cont); err != nil {

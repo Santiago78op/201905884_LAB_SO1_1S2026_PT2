@@ -47,6 +47,7 @@ type EnforceResult struct {
 	Removed    int // contenedores eliminados en este tick
 	ActiveLow  int // bajo consumo activos tras enforce
 	ActiveHigh int // alto consumo activos tras enforce
+	Exited     int // contenedores en estado Exited (terminaron solos, no removidos)
 }
 
 // Manager gestiona el ciclo de vida de los contenedores Docker del daemon.
@@ -164,9 +165,37 @@ func enrichWithMetrics(containers []Container, processes []model.ProcessInfo) []
 	return containers
 }
 
+// countExited cuenta contenedores gestionados (no sistema) en estado Exited.
+// Estos son contenedores que terminaron solos (ej: alpine sleep 240 tras 4 minutos).
+func (m *Manager) countExited() int {
+	out, err := exec.Command(
+		"docker", "ps", "-a", "--no-trunc",
+		"--filter", "status=exited",
+		"--format", "{{.ID}}\t{{.Image}}\t{{.Command}}\t{{.Names}}",
+	).Output()
+	if err != nil {
+		return 0
+	}
+
+	count := 0
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		parts := strings.SplitN(scanner.Text(), "\t", 4)
+		if len(parts) < 4 {
+			continue
+		}
+		c := Container{ID: parts[0], Image: parts[1], Command: parts[2], Name: strings.TrimPrefix(parts[3], "/")}
+		if cat := classify(c); cat == CategoryLowConsumption || cat == CategoryHighConsumption {
+			count++
+		}
+	}
+	return count
+}
+
 // stopAndRemove detiene y elimina un contenedor por ID.
+// -t 2: espera máximo 2s antes de forzar SIGKILL (evita bloqueos de 10s por tick).
 func (m *Manager) stopAndRemove(id string) error {
-	if err := exec.Command("docker", "stop", id).Run(); err != nil {
+	if err := exec.Command("docker", "stop", "-t", "2", id).Run(); err != nil {
 		return fmt.Errorf("docker stop: %w", err)
 	}
 	if err := exec.Command("docker", "rm", id).Run(); err != nil {
@@ -276,5 +305,6 @@ func (m *Manager) Enforce(processes []model.ProcessInfo) (EnforceResult, error) 
 
 	result.ActiveLow = lowActive
 	result.ActiveHigh = highActive
+	result.Exited = m.countExited()
 	return result, nil
 }
