@@ -2,7 +2,13 @@
 
 ## Descripcion General
 
-El daemon es un proceso en espacio de usuario escrito en Go que lee periodicamente los archivos virtuales expuestos por el modulo del kernel en `/proc`, los parsea y persiste los datos en archivos JSON Lines.
+El daemon es un proceso en espacio de usuario escrito en Go que:
+
+1. Carga las variables de entorno desde `.env`
+2. Levanta los contenedores de Grafana y Valkey via Docker Compose
+3. Carga el modulo de kernel via script bash
+4. Lee periodicamente los archivos virtuales expuestos por el modulo en `/proc`
+5. Parsea los datos y los persiste en Valkey para su visualizacion en Grafana
 
 Fuentes que consume:
 
@@ -11,8 +17,8 @@ Fuentes que consume:
 
 Salidas que produce:
 
-- `/tmp/meminfo.jsonl` → una linea JSON por lectura de memoria
-- `/tmp/continfo.jsonl` → una linea JSON por lectura de contenedores
+- Valkey lista `meminfo` → una entrada JSON por lectura de memoria
+- Valkey lista `continfo` → una entrada JSON por lectura de contenedores
 
 ## Arquitectura por Capas
 
@@ -23,22 +29,32 @@ El daemon sigue un diseño de capas donde cada paquete tiene una unica responsab
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                        KERNEL SPACE                             │
-│  /proc/meminfo_pr2_so1_201905884   → RAM_TOTAL_MB, FREE, USED  │
-│  /proc/continfo_pr2_so1_201905884  → PID, VSZ, RSS, MEM, CPU   │
+│  /proc/meminfo_pr2_so1_201905884   → JSON RAM stats            │
+│  /proc/continfo_pr2_so1_201905884  → JSON procesos + cgroups   │
 └──────────────┬──────────────────────────────┬───────────────────┘
                │ insmod (al inicio)            │ polling cada 5s
 ┌──────────────▼──────────────────────────────▼───────────────────┐
 │                        USER SPACE (Go)                          │
 │                                                                 │
+│  godotenv.Load()            → carga variables de .env          │
+│          ↓                                                      │
+│  docker compose up -d       → levanta Grafana + Valkey         │
+│          ↓                                                      │
 │  kernel.Load()              → carga el .ko via script bash     │
 │          ↓                                                      │
-│  source.FileReader.Read()   → []byte (texto crudo)             │
+│  source.FileReader.Read()   → []byte (JSON crudo)              │
 │          ↓                                                      │
 │  parser.ParseMemInfo()      → model.MemStats                   │
 │  parser.ParseContInfo()     → model.ContainerReport            │
 │          ↓                                                      │
-│  sink.JSONLineFile.Write()  → /tmp/meminfo.jsonl               │
-│                               /tmp/continfo.jsonl              │
+│  sink.ValkeyWriter.Write()  → RPUSH meminfo / continfo         │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────────┐
+│                     DOCKER (docker compose)                     │
+│                                                                 │
+│  valkey_so1  (puerto 6379)  → almacena listas meminfo/continfo │
+│  grafana_so1 (puerto 3000)  → visualiza datos via redis-plugin │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -46,15 +62,10 @@ El daemon sigue un diseño de capas donde cada paquete tiene una unica responsab
 
 ```text
 201905884_LAB_SO1_1S2026_PT2/
-├── scripts/
-│   └── load_kernel_module.sh          # compila e instala el .ko; verifica /proc
-├── Kernel/
-│   ├── pr2_so1_201905884.c
-│   └── Makefile
 └── Daemon/
     ├── cmd/
     │   └── daemon/
-    │       └── main.go                # entrada: flags + kernel.Load + senales OS
+    │       └── main.go                # entrada: .env + compose up + kernel.Load + senales OS
     ├── internal/
     │   ├── kernel/
     │   │   └── loader.go              # ejecuta el script bash desde Go
@@ -63,14 +74,27 @@ El daemon sigue un diseño de capas donde cada paquete tiene una unica responsab
     │   ├── model/
     │   │   └── metrics.go             # structs de dominio: MemStats, ContainerReport
     │   ├── parser/
-    │   │   ├── meminfo.go             # texto crudo → MemStats
-    │   │   └── continfo.go            # texto crudo → ContainerReport
+    │   │   ├── meminfo.go             # JSON crudo → MemStats
+    │   │   └── continfo.go            # JSON crudo → ContainerReport
     │   ├── sink/
-    │   │   └── jsonfile.go            # struct → JSON Lines en archivo
+    │   │   ├── jsonfile.go            # struct → JSON Lines en archivo (legacy)
+    │   │   └── valkey.go              # struct → RPUSH en Valkey
     │   └── source/
     │       └── file_reader.go         # lee /proc con cancelacion por contexto
+    ├── docker/
+    │   ├── docker-compose.yml         # Grafana + Valkey en red compartida
+    │   └── grafana/
+    │       └── provisioning/
+    │           └── datasources/
+    │               └── valkey.yml     # datasource Valkey preconfigurado
+    ├── kernel/
+    │   ├── pr2_so1_201905884.c
+    │   └── Makefile
+    ├── scripts/
+    │   └── load_kernel_module.sh      # compila e instala el .ko; verifica /proc
     ├── doc/
     │   └── Daemon.md
+    ├── .env                           # variables de entorno del daemon
     ├── go.mod
     └── go.sum
 ```
@@ -283,13 +307,17 @@ Mapeo de columnas a campos del struct:
 
 ### 5. sink — Persistencia de datos
 
-Define la interfaz `Writer` y su implementacion `JSONLineFile`.
+Define la interfaz `Writer` y dos implementaciones: `JSONLineFile` y `ValkeyWriter`.
 
 ```go
 type Writer interface {
     Write(v any) error
 }
+```
 
+#### 5.1 JSONLineFile (legacy)
+
+```go
 type JSONLineFile struct {
     Path string
 }
@@ -302,14 +330,47 @@ type JSONLineFile struct {
 3. Serializa el struct a JSON con `json.Marshal(v)`.
 4. Escribe los bytes seguidos de `'\n'` al final del archivo.
 
-**Por que JSON Lines y no un array JSON:**
+#### 5.2 ValkeyWriter
 
-| Aspecto | JSON Lines `.jsonl` | Array JSON `[]` |
+```go
+type ValkeyWriter struct {
+    Client *redis.Client
+    Key    string
+}
+
+func NewValkeyWriter(addr string, key string) *ValkeyWriter
+```
+
+**Flujo de `Write()`:**
+
+1. Serializa el struct a JSON con `json.Marshal(data)`.
+2. Ejecuta `RPUSH <Key> <json>` en Valkey — agrega al final de la lista.
+3. Envuelve cualquier error con contexto (`"valkey: error escribiendo en <key>"`).
+
+**Por que `RPUSH` y no `SET`:**
+`RPUSH` acumula historico en orden cronologico. Con `SET` solo existiria la ultima lectura y se perderia el historial.
+
+**Keys utilizadas en Valkey:**
+
+| Key | Tipo | Contenido |
 |---|---|---|
-| Agregar entrada | Solo append al final | Requiere leer y reescribir |
-| Leer en tiempo real | `tail -f archivo.jsonl` | No es posible directamente |
-| Tolerancia a corrupcion | Cada linea es independiente | Un error rompe todo el archivo |
-| Memoria requerida | Constante | Proporcional al tamano total |
+| `meminfo` | Lista | Una entrada JSON por lectura de RAM |
+| `continfo` | Lista | Una entrada JSON por lectura de contenedores |
+
+**Comandos de verificacion:**
+
+```bash
+# Cantidad de entradas
+sudo docker exec -it valkey_so1 valkey-cli LLEN meminfo
+sudo docker exec -it valkey_so1 valkey-cli LLEN continfo
+
+# Ultima entrada
+sudo docker exec -it valkey_so1 valkey-cli LINDEX meminfo -1
+sudo docker exec -it valkey_so1 valkey-cli LINDEX continfo -1
+
+# Rango completo
+sudo docker exec -it valkey_so1 valkey-cli LRANGE meminfo 0 -1
+```
 
 ### 6. app/service.go — Orquestador
 
@@ -358,51 +419,45 @@ Read() ok? → Parse() ok? → Write()
 
 Conecta todas las piezas y maneja las senales del OS.
 
+**Secuencia de arranque:**
+
+1. Cargar `.env` con `godotenv.Load()`
+2. Parsear flags (`--kernel-script`, `--container-id`)
+3. Cargar modulo de kernel
+4. Levantar contenedores Docker (Grafana + Valkey)
+5. Configurar manejo de senales
+6. Crear `Service` con `ValkeyWriter`
+7. Ejecutar loop principal
+
+**Fragmento clave — levantado de contenedores:**
+
 ```go
-func main() {
-    // Flags de linea de comandos
-    kernelScript := flag.String("kernel-script", "scripts/load_kernel_module.sh", "...")
-    containerID  := flag.String("container-id", "", "...")
-    flag.Parse()
-
-    // Cargar el modulo antes de arrancar el daemon
-    if err := kernel.Load(kernel.LoadOpts{
-        ScriptPath:  *kernelScript,
-        ContainerID: *containerID,
-    }); err != nil {
-        log.Fatalf("main: no se pudo cargar el modulo: %v", err)
-    }
-
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
-    sigChan := make(chan os.Signal, 1)
-    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-    go func() {
-        sig := <-sigChan
-        log.Printf("Received signal: %v, shutting down...", sig)
-        cancel()
-    }()
-
-    svc := &app.Service{
-        MemReader:  source.FileReader{Path: "/proc/meminfo_pr2_so1_201905884"},
-        ContReader: source.FileReader{Path: "/proc/continfo_pr2_so1_201905884"},
-        MemWriter:  sink.JSONLineFile{Path: "/tmp/meminfo.jsonl"},
-        ContWriter: sink.JSONLineFile{Path: "/tmp/continfo.jsonl"},
-        Interval:   5 * time.Second,
-    }
-
-    log.Println("main: daemon iniciado")
-    if err := svc.Run(ctx); err != nil {
-        log.Fatalf("main: error fatal: %v", err)
-    }
-    log.Println("main: daemon detenido")
+composeFile := os.Getenv("COMPOSE_FILE_PATH")
+cmdCompose := exec.Command("sudo", "docker", "compose", "-f", composeFile, "up", "-d")
+cmdCompose.Stdout = os.Stdout
+cmdCompose.Stderr = os.Stderr
+if err := cmdCompose.Run(); err != nil {
+    log.Fatalf("main: error al levantar contenedores: %v", err)
 }
 ```
 
-**Por que `kernel.Load()` va antes del contexto:**
-Si el modulo no carga, las entradas `/proc` no existen y el daemon no tiene fuentes de datos. Fallar rapido con `log.Fatalf` evita que el daemon arranque en un estado invalido.
+**Fragmento clave — configuracion del Service con Valkey:**
+
+```go
+svc := &app.Service{
+    MemReader:  source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_MEM_PATH")},
+    ContReader: source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_CONT_PATH")},
+    MemWriter:  sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_MEM")),
+    ContWriter: sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CONT")),
+    Interval:   5 * time.Second,
+}
+```
+
+**Por que `kernel.Load()` va antes de levantar contenedores:**
+Si el modulo no carga, las entradas `/proc` no existen. Fallar rapido con `log.Fatalf` evita arrancar en estado invalido.
+
+**Por que `docker compose up -d` en Go y no en el script:**
+El daemon es responsable de su propia infraestructura. Al iniciar levanta todo lo que necesita y al terminar (Paso 5) podra limpiarlo.
 
 **Por que `flag.String()` retorna `*string`:**
 `flag.String()` retorna un puntero. El `*` en `*kernelScript` lo desreferencia para obtener el valor string. Esto permite que el paquete `flag` modifique la variable internamente al hacer `Parse()`.
@@ -417,6 +472,71 @@ Si el modulo no carga, las entradas `/proc` no existen y el daemon no tiene fuen
 | `SIGTERM` | `kill <pid>`, `systemd stop`, Docker al detener contenedor |
 | `SIGINT` | `Ctrl+C` en terminal |
 
+### 8. docker/ — Infraestructura
+
+#### docker-compose.yml
+
+Define dos servicios en una red compartida llamada `monitoring`:
+
+| Servicio | Imagen | Puerto | Proposito |
+|---|---|---|---|
+| `valkey_so1` | `valkey/valkey:latest` | `6379` | Base de datos donde el daemon escribe metricas |
+| `grafana_so1` | `grafana/grafana:latest` | `3000` | Visualizacion de datos desde Valkey |
+
+Variables de entorno usadas (desde `.env`):
+
+| Variable | Valor por defecto | Uso |
+|---|---|---|
+| `VALKEY_PORT` | `6379` | Puerto expuesto de Valkey |
+| `GRAFANA_PORT` | `3000` | Puerto expuesto de Grafana |
+| `GRAFANA_USER` | `admin` | Usuario inicial de Grafana |
+| `GRAFANA_PASSWORD` | `admin` | Contrasena inicial de Grafana |
+
+El plugin `redis-datasource` se instala automaticamente en Grafana via la variable `GF_INSTALL_PLUGINS`. Este plugin es compatible con Valkey porque implementa el protocolo Redis.
+
+#### grafana/provisioning/datasources/valkey.yml
+
+Configura automaticamente el datasource de Valkey en Grafana al iniciar el contenedor:
+
+```yaml
+apiVersion: 1
+datasources:
+  - name: Valkey
+    type: redis-datasource
+    access: proxy
+    url: redis://valkey:6379
+    isDefault: true
+    editable: true
+```
+
+La URL usa `valkey` (nombre del servicio Docker) en lugar de `localhost` porque ambos contenedores estan en la misma red `monitoring`.
+
+#### .env
+
+Centraliza toda la configuracion del daemon:
+
+```env
+# Kernel
+KERNEL_SCRIPT_PATH=scripts/load_kernel_module.sh
+
+# Proc sources
+FILE_READER_SERVICE_MEM_PATH=/proc/meminfo_pr2_so1_201905884
+FILE_READER_SERVICE_CONT_PATH=/proc/continfo_pr2_so1_201905884
+
+# Valkey
+VALKEY_ADDR=localhost:6379
+VALKEY_KEY_MEM=meminfo
+VALKEY_KEY_CONT=continfo
+
+# Docker Compose
+COMPOSE_FILE_PATH=docker/docker-compose.yml
+
+# Grafana
+GRAFANA_PORT=3000
+GRAFANA_USER=admin
+GRAFANA_PASSWORD=admin
+```
+
 ## Ciclo de Vida del Daemon
 
 ### 1. Compilar
@@ -429,48 +549,43 @@ go build -o daemon_bin ./cmd/daemon
 ### 2. Ejecutar
 
 ```bash
-# Sin filtro de contenedor (desde la raiz del proyecto)
-sudo ./Daemon/daemon_bin
+# Desde la carpeta Daemon/ (carga .env automaticamente)
+sudo go run cmd/daemon/main.go
 
-# Con container ID especifico
-sudo ./Daemon/daemon_bin --container-id=abc123def456
-
-# Con ruta explicita al script
-sudo ./Daemon/daemon_bin --kernel-script=/ruta/absoluta/scripts/load_kernel_module.sh
+# O con el binario compilado
+sudo ./daemon_bin
 ```
 
 Salida esperada en consola:
 
 ```text
-2026/03/01 10:00:00 main: cargando modulo de kernel...
-2026/03/01 10:00:00 [kernel-loader] compilando...
-2026/03/01 10:00:03 [kernel-loader] modulo cargado OK
-2026/03/01 10:00:03 main: modulo de kernel listo
-2026/03/01 10:00:03 main: daemon iniciado
-2026/03/01 10:00:08 main: daemon iniciado  ← primer tick a los 5s
+2026/03/14 18:57:15 main: archivo .env cargado exitosamente
+2026/03/14 18:57:15 main: cargando modulo de Kernel ...
+2026/03/14 18:57:15 kernel: [kernel-loader] modulo ya cargado
+2026/03/14 18:57:15 main: modulo de Kernel cargado exitosamente
+2026/03/14 18:57:15 main: levantando contenedores de Grafana y Valkey ...
+2026/03/14 18:57:18 main: contenedores de Grafana y Valkey levantados exitosamente
+2026/03/14 18:57:18 main: daemon iniciado
 ```
 
-### 3. Verificar salida en tiempo real
+### 3. Verificar datos en Valkey
 
 ```bash
-# Estadisticas de memoria
-tail -f /tmp/meminfo.jsonl
+# Cantidad de entradas acumuladas
+sudo docker exec -it valkey_so1 valkey-cli LLEN meminfo
+sudo docker exec -it valkey_so1 valkey-cli LLEN continfo
 
-# Informacion de contenedores
-tail -f /tmp/continfo.jsonl
+# Ultima entrada
+sudo docker exec -it valkey_so1 valkey-cli LINDEX meminfo -1
+sudo docker exec -it valkey_so1 valkey-cli LINDEX continfo -1
 ```
 
-Ejemplo de entrada en `/tmp/meminfo.jsonl`:
+### 4. Verificar en Grafana
 
-```json
-{"MemTotal":7856,"MemFree":4120,"MemUsed":3736,"Timestamp":"2026-03-01T10:00:05Z"}
-```
-
-Ejemplo de entrada en `/tmp/continfo.jsonl`:
-
-```json
-{"FilterID":"abc123","Processes":[{"Pid":1234,"Name":"dockerd","VSZkb":102400,"RSSkb":51200,"MemPct":1,"CPURaw":9876543,"ContainerID":"-"}],"ContainersActive":1,"Timestamp":"2026-03-01T10:00:05Z"}
-```
+1. Abrir `http://localhost:3000`
+2. Ir a **Explore**
+3. Seleccionar datasource **Valkey**
+4. Query: `LRANGE meminfo 0 -1` o `LRANGE continfo 0 -1`
 
 ### 4. Detener limpiamente
 
@@ -525,35 +640,34 @@ Salida al detener:
 ## Comandos de Referencia
 
 ```bash
-# Compilar
+# ── Compilar ─────────────────────────────────────────────
 cd Daemon
 go build -o daemon_bin ./cmd/daemon
 
-# Ejecutar (desde la raiz del proyecto, requiere sudo para insmod)
-sudo ./Daemon/daemon_bin
+# ── Ejecutar ─────────────────────────────────────────────
+sudo go run cmd/daemon/main.go
 
-# Ejecutar con container ID
-sudo ./Daemon/daemon_bin --container-id=abc123def456
+# ── Kernel ───────────────────────────────────────────────
+lsmod | grep pr2_so1_201905884          # verificar que el modulo esta cargado
+ls /proc/ | grep pr2                    # verificar entradas /proc
+sudo rmmod pr2_so1_201905884            # descargar manualmente
 
-# Verificar que el modulo del kernel esta cargado
-lsmod | grep pr2_so1_201905884
+# ── Docker ───────────────────────────────────────────────
+cd Daemon/docker
+sudo docker compose up -d               # levantar contenedores
+sudo docker compose down                # detener contenedores
+sudo docker compose ps                  # ver estado
 
-# Verificar que las entradas /proc existen
-ls /proc/ | grep pr2
+# ── Valkey ───────────────────────────────────────────────
+sudo docker exec -it valkey_so1 valkey-cli LLEN meminfo
+sudo docker exec -it valkey_so1 valkey-cli LLEN continfo
+sudo docker exec -it valkey_so1 valkey-cli LINDEX meminfo -1
+sudo docker exec -it valkey_so1 valkey-cli LRANGE meminfo 0 -1
 
-# Ver logs de memoria en tiempo real
-tail -f /tmp/meminfo.jsonl
+# ── Grafana ──────────────────────────────────────────────
+# Abrir http://localhost:3000 (admin/admin)
 
-# Ver logs de contenedores en tiempo real
-tail -f /tmp/continfo.jsonl
-
-# Ver ultimas 5 entradas de memoria formateadas
-tail -5 /tmp/meminfo.jsonl | python3 -m json.tool
-
-# Descargar el modulo manualmente
-sudo rmmod pr2_so1_201905884
-
-# Detener el daemon
+# ── Detener el daemon ────────────────────────────────────
 kill $(pgrep daemon_bin)
 ```
 
@@ -564,7 +678,10 @@ kill $(pgrep daemon_bin)
 | Lenguaje | Go |
 | Patron | Capas: kernel → source → parser → model → sink, orquestado por service |
 | Fuentes | `/proc/meminfo_pr2_so1_201905884` y `/proc/continfo_pr2_so1_201905884` |
-| Salida | `/tmp/meminfo.jsonl` y `/tmp/continfo.jsonl` (JSON Lines) |
-| Intervalo | 5 segundos (configurable en `main.go`) |
+| Salida | Valkey listas `meminfo` y `continfo` via `RPUSH` |
+| Visualizacion | Grafana en `http://localhost:3000` con plugin `redis-datasource` |
+| Infraestructura | Docker Compose: `valkey_so1` (6379) + `grafana_so1` (3000) |
+| Configuracion | Variables de entorno desde `Daemon/.env` |
+| Intervalo | 5 segundos (configurable via `Interval` en `main.go`) |
 | Apagado | Limpio via `SIGTERM` o `SIGINT` con contexto cancelable |
 | Tolerancia a fallos | Falla suave: errores se loguean, el daemon no se detiene |
