@@ -42,11 +42,25 @@ type ProcessInfo struct {
 	ContainerID string `json:"container_id"`
 }
 
+/*
+*
+tick N-1:  ContainersActive = 5
+tick N:    ContainersActive = 3
+
+	                 ↓
+	Eliminados en este tick = 5 - 3 = 2  (si fue positivo)
+	Inactivos acumulados    = anterior + 2
+
+- ContainersRemoved int — cuántos se eliminaron en este tick (comparado con el anterior)
+- ContainersInactive int — acumulado total de eliminados desde que inició el daemon
+*/
 type ContainerReport struct {
-	FilterID         string
-	Processes        []ProcessInfo
-	ContainersActive int
-	Timestamp        time.Time
+	FilterID           string        `json:"filter_id"`
+	Processes          []ProcessInfo `json:"processes"`
+	ContainersActive   int           `json:"containers_active"`
+	ContainersRemoved  int           `json:"containers_removed"`
+	ContainersInactive int           `json:"containers_inactive"`
+	Timestamp          time.Time     `json:"timestamp"`
 }
 
 type JsonContInfo struct {

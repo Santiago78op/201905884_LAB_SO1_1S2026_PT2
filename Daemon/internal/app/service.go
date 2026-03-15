@@ -27,6 +27,8 @@ import (
   - MemWriter: es un sink.Writer que se encarga de escribir los datos de memoria en un destino, como un archivo JSON.
   - ContWriter: es un sink.Writer que se encarga de escribir los datos de contenedores en un destino, como un archivo JSON.
   - Interval: es un time.Duration que define el intervalo de tiempo entre cada recolección de datos.
+  - prevContainersActive: es un contador que almacena el número de contenedores activos en el tick anterior.
+  - totalContainersRemoved: es un contador acumulativo que almacena el total de contenedores eliminados desde que inició el servicio.
 */
 type Service struct {
 	MemReader  source.Reader
@@ -34,6 +36,9 @@ type Service struct {
 	MemWriter  sink.Writer
 	ContWriter sink.Writer
 	Interval   time.Duration
+
+	prevContainersActive   int
+	totalContainersRemoved int
 }
 
 /**
@@ -87,8 +92,21 @@ func (s *Service) tick(ctx context.Context) {
 		cont, err := parser.ParserContInfo(string(rawCont))
 		if err != nil {
 			log.Printf("service: error parseando continfo: %v", err)
-		} else if err := s.ContWriter.Write(cont); err != nil {
-			log.Printf("service: error escribiendo continfo: %v", err)
+		} else {
+			if s.prevContainersActive > cont.ContainersActive {
+				removed := s.prevContainersActive - cont.ContainersActive
+				s.totalContainersRemoved += removed
+				cont.ContainersRemoved = removed
+			} else {
+				cont.ContainersRemoved = 0
+			}
+
+			cont.ContainersInactive = s.totalContainersRemoved
+			s.prevContainersActive = cont.ContainersActive
+
+			if err := s.ContWriter.Write(cont); err != nil {
+				log.Printf("service: error escribiendo continfo: %v", err)
+			}
 		}
 	}
 }
