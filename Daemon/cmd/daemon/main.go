@@ -16,6 +16,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -78,6 +79,20 @@ func main() {
 
 	log.Println("main: módulo de Kernel cargado exitosamente")
 
+	// Levantar contenedores de Grafana y Valkey
+	log.Println("main: levantando contenedores de Grafana y Valkey ...")
+	composeFile := os.Getenv("COMPOSE_FILE_PATH")
+
+	cmdCompose := exec.Command("sudo", "docker", "compose", "-f", composeFile, "up", "-d")
+	cmdCompose.Stdout = os.Stdout
+	cmdCompose.Stderr = os.Stderr
+
+	if err := cmdCompose.Run(); err != nil {
+		log.Fatalf("main: error al levantar contenedores con Docker Compose: %v", err)
+	}
+
+	log.Println("main: contenedores de Grafana y Valkey levantados exitosamente")
+
 	// Se parsean los flags para que estén disponibles en el programa.
 	flag.Parse()
 
@@ -112,8 +127,8 @@ func main() {
 	svc := &app.Service{
 		MemReader:  source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_MEM_PATH")},
 		ContReader: source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_CONT_PATH")},
-		MemWriter:  sink.JSONLineFile{Path: os.Getenv("FILE_JSON_SERVICE_MEM_PATH")},
-		ContWriter: sink.JSONLineFile{Path: os.Getenv("FILE_JSON_SERVICE_CONT_PATH")},
+		MemWriter:  sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_MEM")),
+		ContWriter: sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CONT")),
 		Interval:   5 * time.Second,
 	}
 
