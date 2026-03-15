@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"daemon/internal/docker"
+	"daemon/internal/model"
 	"daemon/internal/parser"
 	"daemon/internal/sink"
 	"daemon/internal/source"
@@ -31,11 +32,19 @@ import (
   - prevContainersActive: es un contador que almacena el número de contenedores activos en el tick anterior.
   - totalContainersRemoved: es un contador acumulativo que almacena el total de contenedores eliminados desde que inició el servicio.
 */
+// procEntry es una entrada plana de proceso para Valkey/Grafana.
+// Embebe ProcessInfo y agrega Timestamp para poder usarlo en time series.
+type procEntry struct {
+	model.ProcessInfo
+	Timestamp time.Time `json:"timestamp"`
+}
+
 type Service struct {
 	MemReader  source.Reader
 	ContReader source.Reader
 	MemWriter  sink.Writer
 	ContWriter sink.Writer
+	ProcWriter sink.Writer // una entrada por proceso, para Top Rankings en Grafana
 	Interval   time.Duration
 	Docker     *docker.Manager
 
@@ -108,6 +117,14 @@ func (s *Service) tick(ctx context.Context) {
 
 			if err := s.ContWriter.Write(cont); err != nil {
 				log.Printf("service: error escribiendo continfo: %v", err)
+			}
+
+			// Escribir cada proceso como entrada plana para Top Rankings en Grafana
+			for _, proc := range cont.Processes {
+				entry := procEntry{proc, cont.Timestamp}
+				if err := s.ProcWriter.Write(entry); err != nil {
+					log.Printf("service: error escribiendo proceso pid=%d: %v", proc.Pid, err)
+				}
 			}
 		}
 	}
