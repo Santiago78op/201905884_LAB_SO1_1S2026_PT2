@@ -13,6 +13,7 @@ import (
 	"log"
 	"time"
 
+	"daemon/internal/docker"
 	"daemon/internal/parser"
 	"daemon/internal/sink"
 	"daemon/internal/source"
@@ -36,8 +37,8 @@ type Service struct {
 	MemWriter  sink.Writer
 	ContWriter sink.Writer
 	Interval   time.Duration
+	Docker     *docker.Manager
 
-	prevContainersActive   int
 	totalContainersRemoved int
 }
 
@@ -93,16 +94,16 @@ func (s *Service) tick(ctx context.Context) {
 		if err != nil {
 			log.Printf("service: error parseando continfo: %v", err)
 		} else {
-			if s.prevContainersActive > cont.ContainersActive {
-				removed := s.prevContainersActive - cont.ContainersActive
-				s.totalContainersRemoved += removed
-				cont.ContainersRemoved = removed
+			// Aplicar invariantes y gestionar contenedores
+			result, dockerErr := s.Docker.Enforce(cont.Processes)
+			if dockerErr != nil {
+				log.Printf("service: docker enforce: %v", dockerErr)
 			} else {
-				cont.ContainersRemoved = 0
+				s.totalContainersRemoved += result.Removed
+				cont.ContainersRemoved = result.Removed
+				cont.ContainersInactive = s.totalContainersRemoved
+				cont.ContainersActive = result.ActiveLow + result.ActiveHigh
 			}
-
-			cont.ContainersInactive = s.totalContainersRemoved
-			s.prevContainersActive = cont.ContainersActive
 
 			if err := s.ContWriter.Write(cont); err != nil {
 				log.Printf("service: error escribiendo continfo: %v", err)

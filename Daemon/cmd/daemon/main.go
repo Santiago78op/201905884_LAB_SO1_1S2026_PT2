@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"daemon/internal/app"
+	"daemon/internal/docker"
 	"daemon/internal/kernel"
 	"daemon/internal/sink"
 	"daemon/internal/source"
@@ -93,6 +94,13 @@ func main() {
 
 	log.Println("main: contenedores de Grafana y Valkey levantados exitosamente")
 
+	// Registrar cronjob (paso 2): crea 5 contenedores aleatorios cada 2 minutos
+	cronScript := os.Getenv("CRON_SCRIPT_PATH")
+	if err := app.RegisterCronjob(cronScript); err != nil {
+		log.Fatalf("main: error registrando cronjob: %v", err)
+	}
+	log.Println("main: cronjob registrado (cada 2 minutos)")
+
 	// Se parsean los flags para que estén disponibles en el programa.
 	flag.Parse()
 
@@ -131,12 +139,20 @@ func main() {
 		MemWriter:  sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_MEM")),
 		ContWriter: sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CONT")),
 		Interval:   5 * time.Second,
+		Docker:     docker.NewManager(),
 	}
 
 	log.Println("main: daemon iniciado")
 
 	if err := svc.Run(ctx); err != nil {
 		log.Fatalf("main: error fatal: %v", err)
+	}
+
+	// Paso 5: eliminar el cronjob antes de finalizar
+	if err := app.RemoveCronjob(cronScript); err != nil {
+		log.Printf("main: error eliminando cronjob: %v", err)
+	} else {
+		log.Println("main: cronjob eliminado")
 	}
 
 	log.Println("main: daemon detenido")
