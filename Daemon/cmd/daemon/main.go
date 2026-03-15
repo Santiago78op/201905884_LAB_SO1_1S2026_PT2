@@ -24,6 +24,8 @@ import (
 	"daemon/internal/kernel"
 	"daemon/internal/sink"
 	"daemon/internal/source"
+
+	"github.com/joho/godotenv"
 )
 
 /**
@@ -36,10 +38,18 @@ import (
  */
 func main() {
 
+	// Carga de Variables de Entorno env
+	err := godotenv.Load()
+	if err != nil {
+		log.Printf("main: no se pudo cargar el archivo .env: %v", err)
+	} else {
+		log.Println("main: archivo .env cargado exitosamente")
+	}
+
 	// Kernel script flag: permite especificar la ruta al script que carga el módulo del kernel, con un valor por defecto.
 	kernelScript := flag.String(
 		"kernel-script",
-		"/home/julian/Julian/201905884_LAB_SO1_1S2026_PT2/scripts/load_kernel_module.sh",
+		os.Getenv("KERNEL_SCRIPT_PATH"),
 		"Ruta al script que carga el módulo de kernel",
 	)
 
@@ -100,10 +110,10 @@ func main() {
 
 	// Conector de todas las piezas del servicio
 	svc := &app.Service{
-		MemReader:  source.FileReader{Path: "/proc/meminfo_pr2_so1_201905884"},
-		ContReader: source.FileReader{Path: "/proc/continfo_pr2_so1_201905884"},
-		MemWriter:  sink.JSONLineFile{Path: "/tmp/meminfo.jsonl"},
-		ContWriter: sink.JSONLineFile{Path: "/tmp/continfo.jsonl"},
+		MemReader:  source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_MEM_PATH")},
+		ContReader: source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_CONT_PATH")},
+		MemWriter:  sink.JSONLineFile{Path: os.Getenv("FILE_JSON_SERVICE_MEM_PATH")},
+		ContWriter: sink.JSONLineFile{Path: os.Getenv("FILE_JSON_SERVICE_CONT_PATH")},
 		Interval:   5 * time.Second,
 	}
 

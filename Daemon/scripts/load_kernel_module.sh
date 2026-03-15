@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # PROJECT_ROOT es el directorio padre de SCRIPT_DIR, asumiendo que este script está en un subdirectorio del proyecto.
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # KERNEL_DIR es el subdirectorio "Kernel" dentro del proyecto, donde se espera que esté el archivo .ko del módulo.
-KERNEL_DIR="${PROJECT_ROOT}/Kernel"
+KERNEL_DIR="${PROJECT_ROOT}/kernel"
 # KO_FILE es la ruta completa al archivo .ko del módulo, construida a partir de KERNEL_DIR y MODULE_NAME.
 KO_FILE="${KERNEL_DIR}/${MODULE_NAME}.ko"
 

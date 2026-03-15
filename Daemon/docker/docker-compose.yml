@@ -1,0 +1,44 @@
+# Red Interna para que Grafana y Valkey se hablen por nombre red_pr2_so1
+networks:
+  red_pr2_so1:
+    driver: bridge
+
+# Servicios: Daemon, Grafana y Valkey
+
+# - GF_INSTALL_PLUGINS=redis-datasource — instala el plugin que permite leer Valkey (es compatible con el protocolo Redis)
+# - depends_on: valkey — Grafana espera a que Valkey esté listo
+# - El volumen ./grafana/provisioning monta tu carpeta local para el datasource
+
+services:
+  valkey:
+        image: valkey/valkey:latest
+        container_name: valkey_so1
+        restart: unless-stopped
+        ports:
+          - "${VALKEY_PORT:-6379}:6379"
+        networks:
+          - red_pr2_so1
+        volumes:
+          - valkey_data:/data
+  grafana:
+        image: grafana/grafana:latest
+        container_name: grafana_so1
+        restart: unless-stopped
+        ports:
+          - "${GRAFANA_PORT:-3000}:3000"
+        environment:
+          - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+          - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+          - GF_INSTALL_PLUGINS=redis-datasource
+        networks:
+          - red_pr2_so1
+        volumes:
+          - grafana_data:/var/lib/grafana
+          - ./grafana/provisioning:/etc/grafana/provisioning
+        depends_on:
+          - valkey
+
+# Volúmenes para persistencia de datos, docker los administra
+volumes:
+    valkey_data:  
+    grafana_data:

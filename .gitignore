@@ -1,2 +1,5 @@
 # Files pdf
 *.pdf
+
+# File claude
+*.claude
