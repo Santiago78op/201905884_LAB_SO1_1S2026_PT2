@@ -13,6 +13,28 @@ type LoadOpts struct {
 	ContainerID string
 }
 
+// Unload ejecuta el script que descarga el módulo de kernel vía rmmod.
+func Unload(scriptPath string) error {
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		return fmt.Errorf("kernel: script de descarga no encontrado %q: %w", scriptPath, err)
+	}
+
+	cmd := exec.Command("/bin/bash", scriptPath)
+	out, err := cmd.CombinedOutput()
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		if line != "" {
+			log.Printf("kernel: %s", line)
+		}
+	}
+
+	if err != nil {
+		return fmt.Errorf("kernel: error al descargar módulo %q: %w\nSalida:\n%s", scriptPath, err, string(out))
+	}
+	return nil
+}
+
 func Load(opts LoadOpts) error {
 	// Verifica que el script exista
 	if _, err := os.Stat(opts.ScriptPath); os.IsNotExist(err) {

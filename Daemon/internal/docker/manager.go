@@ -44,10 +44,12 @@ type Container struct {
 
 // EnforceResult resume el resultado de aplicar los invariantes en un tick.
 type EnforceResult struct {
-	Removed    int // contenedores eliminados en este tick
-	ActiveLow  int // bajo consumo activos tras enforce
-	ActiveHigh int // alto consumo activos tras enforce
-	Exited     int // contenedores en estado Exited (terminaron solos, no removidos)
+	Removed           int         // contenedores eliminados en este tick
+	ActiveLow         int         // bajo consumo activos tras enforce
+	ActiveHigh        int         // alto consumo activos tras enforce
+	Exited            int         // contenedores en estado Exited (terminaron solos, no removidos)
+	ActiveContainers  []Container // contenedores activos tras enforce (para ranking)
+	RemovedContainers []Container // contenedores eliminados en este tick (para ranking)
 }
 
 // Manager gestiona el ciclo de vida de los contenedores Docker del daemon.
@@ -258,6 +260,7 @@ func (m *Manager) Enforce(processes []model.ProcessInfo) (EnforceResult, error) 
 			}
 			log.Printf("docker: eliminado [bajo] %s (%s)", c.ID[:12], c.Image)
 			result.Removed++
+			result.RemovedContainers = append(result.RemovedContainers, c)
 		}
 	}
 
@@ -271,6 +274,7 @@ func (m *Manager) Enforce(processes []model.ProcessInfo) (EnforceResult, error) 
 			}
 			log.Printf("docker: eliminado [alto] %s (%s)", c.ID[:12], c.Image)
 			result.Removed++
+			result.RemovedContainers = append(result.RemovedContainers, c)
 		}
 	}
 
@@ -282,6 +286,20 @@ func (m *Manager) Enforce(processes []model.ProcessInfo) (EnforceResult, error) 
 	highActive := len(high)
 	if highActive > TargetHigh {
 		highActive = TargetHigh
+	}
+
+	// Registrar contenedores activos que sobreviven (para ranking)
+	if len(low) > TargetLow {
+		// low está ordenado desc; los últimos lowActive son los de menor consumo (los que se mantienen)
+		result.ActiveContainers = append(result.ActiveContainers, low[len(low)-lowActive:]...)
+	} else {
+		result.ActiveContainers = append(result.ActiveContainers, low...)
+	}
+	if len(high) > TargetHigh {
+		// high está ordenado desc; los primeros highActive son los de mayor consumo (los que se mantienen)
+		result.ActiveContainers = append(result.ActiveContainers, high[:highActive]...)
+	} else {
+		result.ActiveContainers = append(result.ActiveContainers, high...)
 	}
 
 	// --- Crear contenedores faltantes para cumplir mínimos ---

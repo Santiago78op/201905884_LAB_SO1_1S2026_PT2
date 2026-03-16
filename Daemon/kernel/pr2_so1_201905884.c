@@ -138,28 +138,48 @@ MODULE_PARM_DESC(container_id, "Docker container ID substring used to match proc
 */
 
 /**
- * Función para determinar si un proceso es un proceso "general" relacionado con Docker, 
- * como el demonio de Docker o los procesos de contenedores.
- * 
- * @param task: Puntero a la estructura task_struct del proceso que se desea evaluar.
- * @return: Devuelve true si el proceso es un proceso "general" relacionado con Docker 
- * y false en caso contrario.
- * 
- * Esta función compara el nombre del proceso (task->comm) con una lista de nombres 
- * comunes de procesos relacionados con Docker, como "dockerd", "containerd", 
- * "containerd-shim", "containerd-shim-runc-v2" y "runc".
+ * Función para determinar si un proceso es de infraestructura Docker
+ * (dockerd, containerd, shim, runc).
  */
-static bool is_general_process(const struct task_struct *task)
+static bool is_docker_infra(const struct task_struct *task)
 {
-	/*
-	 * Procesos "generales".
-	 * Estos suelen existir en hosts con Docker.
-	 */
 	return (strcmp(task->comm, "dockerd") == 0) ||
 	       (strcmp(task->comm, "containerd") == 0) ||
 	       (strcmp(task->comm, "containerd-shim") == 0) ||
 	       (strcmp(task->comm, "containerd-shim-runc-v2") == 0) ||
 	       (strcmp(task->comm, "runc") == 0);
+}
+
+/**
+ * Función para determinar si un proceso pertenece a Docker:
+ * - Procesos de infraestructura (dockerd, containerd, shim, runc), o
+ * - Cualquier proceso cuyo cgroup tenga "docker" en su ruta
+ *   (captura los workloads reales: sleep, sh, bc, binarios Go, etc.)
+ *
+ * @param task: Puntero a task_struct del proceso a evaluar.
+ * @return: true si el proceso es de Docker (infraestructura o workload).
+ */
+static bool is_docker_process(struct task_struct *task)
+{
+	if (is_docker_infra(task))
+		return true;
+
+#ifdef CONFIG_MEMCG
+	{
+		struct cgroup_subsys_state *css;
+		char path[CONTAINER_ID];
+		bool in_docker = false;
+
+		css = task_get_css(task, memory_cgrp_id);
+		if (css) {
+			cgroup_path(css->cgroup, path, sizeof(path));
+			css_put(css);
+			in_docker = (strstr(path, "docker") != NULL);
+		}
+		return in_docker;
+	}
+#endif
+	return false;
 }
 
 /**
@@ -383,7 +403,7 @@ static int continfo_show(struct seq_file *m, void *v)
     * que es una macro que permite recorrer la lista de procesos.
     */
     for_each_process(task) {
-        bool include = is_general_process(task); // Variable para determinar si se debe incluir el proceso en la salida
+        bool include = is_docker_process(task); // incluye infraestructura Docker y workloads dentro de cgroups docker
         unsigned long total_jiffies = jiffies; // Variable para almacenar el tiempo de CPU acumulado por el proceso
         char *cmdline = NULL; // Buffer para almacenar la línea de comandos del proceso
         char *container_id = NULL; // Buffer para almacenar el container_id del proceso

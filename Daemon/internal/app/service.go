@@ -11,10 +11,10 @@ package app
 import (
 	"context"
 	"log"
+	"math/rand"
 	"time"
 
 	"daemon/internal/docker"
-	"daemon/internal/model"
 	"daemon/internal/parser"
 	"daemon/internal/sink"
 	"daemon/internal/source"
@@ -32,10 +32,17 @@ import (
   - prevContainersActive: es un contador que almacena el número de contenedores activos en el tick anterior.
   - totalContainersRemoved: es un contador acumulativo que almacena el total de contenedores eliminados desde que inició el servicio.
 */
-// procEntry es una entrada plana de proceso para Valkey/Grafana.
-// Embebe ProcessInfo y agrega Timestamp para poder usarlo en time series.
-type procEntry struct {
-	model.ProcessInfo
+// containerRankEntry es una entrada de contenedor para el ranking en Valkey/Grafana.
+// Incluye el Docker ID completo, métricas de recursos y estado (activo/eliminado).
+type containerRankEntry struct {
+	DockerID  string    `json:"docker_id"`
+	Name      string    `json:"container_name"`
+	Image     string    `json:"image"`
+	Status    string    `json:"status"` // "active" | "removed"
+	RSSkb     uint64    `json:"rss_kb"`
+	VSZkb     uint64    `json:"vsz_kb"`
+	MemPct    uint64    `json:"mem_perc_x100"`
+	CPURaw    uint64    `json:"cpu_perc_x100"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
@@ -44,8 +51,7 @@ type Service struct {
 	ContReader source.Reader
 	MemWriter  sink.Writer
 	ContWriter sink.Writer
-	ProcWriter sink.Writer // una entrada por proceso, para Top Rankings en Grafana
-	Interval   time.Duration
+	ProcWriter sink.Writer // una entrada por contenedor, para Top Rankings en Grafana
 	Docker     *docker.Manager
 
 	totalContainersRemoved int
@@ -57,16 +63,17 @@ type Service struct {
 * Si se cancela el contexto, se detiene el servicio y se devuelve nil.
 * Si ocurre un tick, se llama al método tick para realizar la recolección y escritura de datos.
  */
+// Run ejecuta el loop principal del daemon con intervalos aleatorios entre 20 y 60 segundos,
+// según lo especificado en el enunciado del proyecto.
 func (s *Service) Run(ctx context.Context) error {
-	ticker := time.NewTicker(s.Interval)
-	defer ticker.Stop()
-
 	for {
+		wait := time.Duration(20+rand.Intn(41)) * time.Second
+		log.Printf("service: próxima ejecución en %v", wait)
 		select {
 		case <-ctx.Done():
 			log.Println("service: deteniendo...")
 			return nil
-		case <-ticker.C:
+		case <-time.After(wait):
 			s.tick(ctx)
 		}
 	}
@@ -119,11 +126,38 @@ func (s *Service) tick(ctx context.Context) {
 				log.Printf("service: error escribiendo continfo: %v", err)
 			}
 
-			// Escribir cada proceso como entrada plana para Top Rankings en Grafana
-			for _, proc := range cont.Processes {
-				entry := procEntry{proc, cont.Timestamp}
+			// Escribir contenedores activos en procinfo para el ranking (incluye Docker ID completo)
+			for _, c := range result.ActiveContainers {
+				entry := containerRankEntry{
+					DockerID:  c.ID,
+					Name:      c.Name,
+					Image:     c.Image,
+					Status:    "active",
+					RSSkb:     c.RSSkb,
+					VSZkb:     c.VSZkb,
+					MemPct:    c.MemPct,
+					CPURaw:    c.CPURaw,
+					Timestamp: cont.Timestamp,
+				}
 				if err := s.ProcWriter.Write(entry); err != nil {
-					log.Printf("service: error escribiendo proceso pid=%d: %v", proc.Pid, err)
+					log.Printf("service: error escribiendo ranking activo %s: %v", c.ID[:12], err)
+				}
+			}
+			// Escribir contenedores eliminados en este tick (incluidos en el ranking)
+			for _, c := range result.RemovedContainers {
+				entry := containerRankEntry{
+					DockerID:  c.ID,
+					Name:      c.Name,
+					Image:     c.Image,
+					Status:    "removed",
+					RSSkb:     c.RSSkb,
+					VSZkb:     c.VSZkb,
+					MemPct:    c.MemPct,
+					CPURaw:    c.CPURaw,
+					Timestamp: cont.Timestamp,
+				}
+				if err := s.ProcWriter.Write(entry); err != nil {
+					log.Printf("service: error escribiendo ranking eliminado %s: %v", c.ID[:12], err)
 				}
 			}
 		}

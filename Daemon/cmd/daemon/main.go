@@ -19,7 +19,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"daemon/internal/app"
 	"daemon/internal/docker"
@@ -80,6 +79,17 @@ func main() {
 
 	log.Println("main: módulo de Kernel cargado exitosamente")
 
+	// Al salir del daemon, descargar el módulo de kernel
+	unloadScript := os.Getenv("KERNEL_UNLOAD_SCRIPT_PATH")
+	defer func() {
+		log.Println("main: descargando módulo de kernel...")
+		if err := kernel.Unload(unloadScript); err != nil {
+			log.Printf("main: error descargando módulo de kernel: %v", err)
+		} else {
+			log.Println("main: módulo de kernel descargado exitosamente")
+		}
+	}()
+
 	// Levantar contenedores de Grafana y Valkey
 	log.Println("main: levantando contenedores de Grafana y Valkey ...")
 	composeFile := os.Getenv("COMPOSE_FILE_PATH")
@@ -139,7 +149,6 @@ func main() {
 		MemWriter:  sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_MEM")),
 		ContWriter: sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CONT")),
 		ProcWriter: sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_PROC")),
-		Interval:   5 * time.Second,
 		Docker:     docker.NewManager(),
 	}
 
