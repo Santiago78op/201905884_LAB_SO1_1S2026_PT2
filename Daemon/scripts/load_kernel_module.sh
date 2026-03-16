@@ -33,16 +33,16 @@ if lsmod | grep -q "^${MODULE_NAME}[[:space:]]"; then
     exit 0
 fi
 
-# 2. Compilar solo si el .ko no existe
+# 2. Compilar siempre en esta máquina para garantizar compatibilidad con el kernel en ejecución.
+# El .ko del repositorio puede haber sido compilado en otra máquina con distinto kernel.
 # El build del kernel no soporta rutas con espacios, por eso se usa un directorio temporal.
-if [ ! -f "${KO_FILE}" ]; then
-    echo "[kernel-loader] compilando..."
-    BUILD_TMP="$(mktemp -d /tmp/kernel_build_XXXXXX)"
-    cp "${KERNEL_DIR}"/*.c "${KERNEL_DIR}"/Makefile "${BUILD_TMP}/"
-    make -C "/lib/modules/$(uname -r)/build" M="${BUILD_TMP}" modules
-    cp "${BUILD_TMP}/${MODULE_NAME}.ko" "${KO_FILE}"
-    rm -rf "${BUILD_TMP}"
-fi
+echo "[kernel-loader] compilando para kernel $(uname -r)..."
+BUILD_TMP="$(mktemp -d /tmp/kernel_build_XXXXXX)"
+cp "${KERNEL_DIR}"/*.c "${KERNEL_DIR}"/Makefile "${BUILD_TMP}/"
+make -C "/lib/modules/$(uname -r)/build" M="${BUILD_TMP}" modules
+cp "${BUILD_TMP}/${MODULE_NAME}.ko" "${KO_FILE}"
+rm -rf "${BUILD_TMP}"
+echo "[kernel-loader] compilación OK"
 
 # 3. Cargar el módulo
 # insmod — carga el .ko en el kernel;

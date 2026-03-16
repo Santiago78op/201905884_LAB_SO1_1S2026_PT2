@@ -3,3 +3,12 @@
 
 # File claude
 *.claude
+
+# Kernel module binario (se compila en cada máquina, no subir al repo)
+*.ko
+*.mod.c
+*.mod.o
+Daemon/kernel/*.o
+Daemon/kernel/modules.order
+Daemon/kernel/Module.symvers
+Daemon/kernel/.tmp_versions/
