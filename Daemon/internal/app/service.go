@@ -11,6 +11,7 @@ package app
 import (
 	"context"
 	"log"
+	"math"
 	"math/rand"
 	"time"
 
@@ -33,7 +34,8 @@ import (
   - totalContainersRemoved: es un contador acumulativo que almacena el total de contenedores eliminados desde que inició el servicio.
 */
 // containerRankEntry es una entrada de contenedor para el ranking en Valkey/Grafana.
-// Incluye el Docker ID completo, métricas de recursos y estado (activo/eliminado).
+// mem_perc y cpu_perc son porcentajes reales con dos decimales (ej: 0.08, 1.18).
+// cpu_perc nunca supera 100.00 aunque el kernel reporte más de un core.
 type containerRankEntry struct {
 	DockerID  string    `json:"docker_id"`
 	Pid       int       `json:"pid"`
@@ -42,9 +44,15 @@ type containerRankEntry struct {
 	Status    string    `json:"status"` // "active" | "removed"
 	RSSkb     uint64    `json:"rss_kb"`
 	VSZkb     uint64    `json:"vsz_kb"`
-	MemPct    uint64    `json:"mem_perc_x100"`
-	CPURaw    uint64    `json:"cpu_perc_x100"`
+	MemPerc   float64   `json:"mem_perc"`  // mem_perc_x100 / 100.0
+	CPUPerc   float64   `json:"cpu_perc"`  // cpu_perc_x100 / 100.0, cap 100.00
 	Timestamp time.Time `json:"timestamp"`
+}
+
+// toPerc convierte un valor x100 del kernel a porcentaje real, nunca mayor a 100.00.
+func toPerc(x100 uint64) float64 {
+	v := math.Round(float64(x100)/100.0*100) / 100 // redondear a 2 decimales
+	return math.Min(v, 100.00)
 }
 
 type Service struct {
@@ -140,8 +148,8 @@ func (s *Service) tick(ctx context.Context) {
 					Status:    "active",
 					RSSkb:     c.RSSkb,
 					VSZkb:     c.VSZkb,
-					MemPct:    c.MemPct,
-					CPURaw:    c.CPURaw,
+					MemPerc:   toPerc(c.MemPct),
+					CPUPerc:   toPerc(c.CPURaw),
 					Timestamp: cont.Timestamp,
 				}
 				if err := s.ProcWriter.Write(entry); err != nil {
@@ -158,8 +166,8 @@ func (s *Service) tick(ctx context.Context) {
 					Status:    "removed",
 					RSSkb:     c.RSSkb,
 					VSZkb:     c.VSZkb,
-					MemPct:    c.MemPct,
-					CPURaw:    c.CPURaw,
+					MemPerc:   toPerc(c.MemPct),
+					CPUPerc:   toPerc(c.CPURaw),
 					Timestamp: cont.Timestamp,
 				}
 				if err := s.ProcWriter.Write(entry); err != nil {
@@ -168,15 +176,18 @@ func (s *Service) tick(ctx context.Context) {
 			}
 
 			// Actualizar sorted sets y hash: estado actual sin duplicados
-			// Member = container_name (legible en Grafana), Score = métrica
+			// Sorted sets usan porcentaje real como score (pie charts en Grafana)
 			for _, c := range result.ActiveContainers {
+				memPerc := toPerc(c.MemPct)
+				cpuPerc := toPerc(c.CPURaw)
+
 				if s.RssRankWriter != nil {
-					if err := s.RssRankWriter.Upsert(float64(c.RSSkb), c.Name); err != nil {
+					if err := s.RssRankWriter.Upsert(memPerc, c.Name); err != nil {
 						log.Printf("service: error upsert rss_rank %s: %v", c.ID[:12], err)
 					}
 				}
 				if s.CpuRankWriter != nil {
-					if err := s.CpuRankWriter.Upsert(float64(c.CPURaw), c.Name); err != nil {
+					if err := s.CpuRankWriter.Upsert(cpuPerc, c.Name); err != nil {
 						log.Printf("service: error upsert cpu_rank %s: %v", c.ID[:12], err)
 					}
 				}
@@ -189,8 +200,8 @@ func (s *Service) tick(ctx context.Context) {
 						Status:    "active",
 						RSSkb:     c.RSSkb,
 						VSZkb:     c.VSZkb,
-						MemPct:    c.MemPct,
-						CPURaw:    c.CPURaw,
+						MemPerc:   memPerc,
+						CPUPerc:   cpuPerc,
 						Timestamp: cont.Timestamp,
 					}
 					if err := s.ContainerHashWriter.HSet(c.Name, entry); err != nil {
