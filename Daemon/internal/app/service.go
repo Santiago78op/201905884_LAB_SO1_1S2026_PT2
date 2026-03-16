@@ -36,6 +36,7 @@ import (
 // Incluye el Docker ID completo, métricas de recursos y estado (activo/eliminado).
 type containerRankEntry struct {
 	DockerID  string    `json:"docker_id"`
+	Pid       int       `json:"pid"`
 	Name      string    `json:"container_name"`
 	Image     string    `json:"image"`
 	Status    string    `json:"status"` // "active" | "removed"
@@ -130,6 +131,7 @@ func (s *Service) tick(ctx context.Context) {
 			for _, c := range result.ActiveContainers {
 				entry := containerRankEntry{
 					DockerID:  c.ID,
+					Pid:       c.Pid,
 					Name:      c.Name,
 					Image:     c.Image,
 					Status:    "active",
@@ -147,6 +149,7 @@ func (s *Service) tick(ctx context.Context) {
 			for _, c := range result.RemovedContainers {
 				entry := containerRankEntry{
 					DockerID:  c.ID,
+					Pid:       c.Pid,
 					Name:      c.Name,
 					Image:     c.Image,
 					Status:    "removed",

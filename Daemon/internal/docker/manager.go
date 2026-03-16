@@ -36,6 +36,7 @@ type Container struct {
 	Name     string
 	Category Category
 	// Métricas desde /proc/continfo (enriquecidas en Enforce)
+	Pid    int
 	RSSkb  uint64
 	VSZkb  uint64
 	MemPct uint64
@@ -135,8 +136,12 @@ func sortDesc(containers []Container) {
 
 // enrichWithMetrics vincula métricas de /proc/continfo a cada contenedor Docker.
 // El kernel retorna los primeros 12 chars del container ID en el campo container_id.
+// También captura el PID del proceso workload principal (primer proceso con container_id válido).
 func enrichWithMetrics(containers []Container, processes []model.ProcessInfo) []Container {
-	type agg struct{ rss, vsz, memPct, cpu uint64 }
+	type agg struct {
+		rss, vsz, memPct, cpu uint64
+		pid                   int
+	}
 	metrics := make(map[string]agg)
 
 	for _, p := range processes {
@@ -149,6 +154,9 @@ func enrichWithMetrics(containers []Container, processes []model.ProcessInfo) []
 		a.vsz += p.VSZkb
 		a.memPct += p.MemPct
 		a.cpu += p.CPURaw
+		if a.pid == 0 {
+			a.pid = p.Pid // PID del primer proceso workload encontrado
+		}
 		metrics[cid] = a
 	}
 
@@ -158,6 +166,7 @@ func enrichWithMetrics(containers []Container, processes []model.ProcessInfo) []
 			prefix = prefix[:12]
 		}
 		if a, ok := metrics[prefix]; ok {
+			containers[i].Pid = a.pid
 			containers[i].RSSkb = a.rss
 			containers[i].VSZkb = a.vsz
 			containers[i].MemPct = a.memPct
