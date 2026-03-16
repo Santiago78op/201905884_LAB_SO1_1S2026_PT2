@@ -167,26 +167,27 @@ func (s *Service) tick(ctx context.Context) {
 			}
 
 			// Actualizar sorted sets rss_rank y cpu_rank: estado actual sin duplicados
+			// Member = container_name (legible en Grafana), Score = métrica
 			for _, c := range result.ActiveContainers {
 				if s.RssRankWriter != nil {
-					if err := s.RssRankWriter.Upsert(float64(c.RSSkb), c.ID); err != nil {
+					if err := s.RssRankWriter.Upsert(float64(c.RSSkb), c.Name); err != nil {
 						log.Printf("service: error upsert rss_rank %s: %v", c.ID[:12], err)
 					}
 				}
 				if s.CpuRankWriter != nil {
-					if err := s.CpuRankWriter.Upsert(float64(c.CPURaw), c.ID); err != nil {
+					if err := s.CpuRankWriter.Upsert(float64(c.CPURaw), c.Name); err != nil {
 						log.Printf("service: error upsert cpu_rank %s: %v", c.ID[:12], err)
 					}
 				}
 			}
 			for _, c := range result.RemovedContainers {
 				if s.RssRankWriter != nil {
-					if err := s.RssRankWriter.Remove(c.ID); err != nil {
+					if err := s.RssRankWriter.Remove(c.Name); err != nil {
 						log.Printf("service: error remove rss_rank %s: %v", c.ID[:12], err)
 					}
 				}
 				if s.CpuRankWriter != nil {
-					if err := s.CpuRankWriter.Remove(c.ID); err != nil {
+					if err := s.CpuRankWriter.Remove(c.Name); err != nil {
 						log.Printf("service: error remove cpu_rank %s: %v", c.ID[:12], err)
 					}
 				}
