@@ -48,12 +48,14 @@ type containerRankEntry struct {
 }
 
 type Service struct {
-	MemReader  source.Reader
-	ContReader source.Reader
-	MemWriter  sink.Writer
-	ContWriter sink.Writer
-	ProcWriter sink.Writer // una entrada por contenedor, para Top Rankings en Grafana
-	Docker     *docker.Manager
+	MemReader     source.Reader
+	ContReader    source.Reader
+	MemWriter     sink.Writer
+	ContWriter    sink.Writer
+	ProcWriter    sink.Writer // una entrada por contenedor, para Top Rankings en Grafana
+	RssRankWriter *sink.ValkeyRankWriter // sorted set por rss_kb — para ZRANGEBYSCORE sin duplicados
+	CpuRankWriter *sink.ValkeyRankWriter // sorted set por cpu_perc_x100 — para ZRANGEBYSCORE sin duplicados
+	Docker        *docker.Manager
 
 	totalContainersRemoved int
 }
@@ -161,6 +163,32 @@ func (s *Service) tick(ctx context.Context) {
 				}
 				if err := s.ProcWriter.Write(entry); err != nil {
 					log.Printf("service: error escribiendo ranking eliminado %s: %v", c.ID[:12], err)
+				}
+			}
+
+			// Actualizar sorted sets rss_rank y cpu_rank: estado actual sin duplicados
+			for _, c := range result.ActiveContainers {
+				if s.RssRankWriter != nil {
+					if err := s.RssRankWriter.Upsert(float64(c.RSSkb), c.ID); err != nil {
+						log.Printf("service: error upsert rss_rank %s: %v", c.ID[:12], err)
+					}
+				}
+				if s.CpuRankWriter != nil {
+					if err := s.CpuRankWriter.Upsert(float64(c.CPURaw), c.ID); err != nil {
+						log.Printf("service: error upsert cpu_rank %s: %v", c.ID[:12], err)
+					}
+				}
+			}
+			for _, c := range result.RemovedContainers {
+				if s.RssRankWriter != nil {
+					if err := s.RssRankWriter.Remove(c.ID); err != nil {
+						log.Printf("service: error remove rss_rank %s: %v", c.ID[:12], err)
+					}
+				}
+				if s.CpuRankWriter != nil {
+					if err := s.CpuRankWriter.Remove(c.ID); err != nil {
+						log.Printf("service: error remove cpu_rank %s: %v", c.ID[:12], err)
+					}
 				}
 			}
 		}

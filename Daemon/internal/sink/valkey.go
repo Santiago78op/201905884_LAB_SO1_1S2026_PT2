@@ -41,3 +41,39 @@ func (v *ValkeyWriter) Write(data any) error {
 
 	return nil
 }
+
+// ValkeyRankWriter mantiene un Sorted Set con score=rss_kb y member=docker_id.
+// Permite queries por rango de RAM sin duplicados: ZRANGEBYSCORE rss_rank <min> <max>.
+type ValkeyRankWriter struct {
+	Client *redis.Client
+	Key    string
+}
+
+func NewValkeyRankWriter(addr string, key string) *ValkeyRankWriter {
+	client := redis.NewClient(&redis.Options{
+		Addr: addr,
+	})
+	return &ValkeyRankWriter{
+		Client: client,
+		Key:    key,
+	}
+}
+
+// Upsert agrega o actualiza el contenedor en el sorted set con su RSS como score.
+func (v *ValkeyRankWriter) Upsert(score float64, member string) error {
+	if err := v.Client.ZAdd(context.Background(), v.Key, redis.Z{
+		Score:  score,
+		Member: member,
+	}).Err(); err != nil {
+		return fmt.Errorf("valkey: zadd %s: %w", v.Key, err)
+	}
+	return nil
+}
+
+// Remove elimina un contenedor del sorted set (cuando es eliminado).
+func (v *ValkeyRankWriter) Remove(member string) error {
+	if err := v.Client.ZRem(context.Background(), v.Key, member).Err(); err != nil {
+		return fmt.Errorf("valkey: zrem %s: %w", v.Key, err)
+	}
+	return nil
+}

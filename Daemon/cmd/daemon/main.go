@@ -144,12 +144,14 @@ func main() {
 
 	// Conector de todas las piezas del servicio
 	svc := &app.Service{
-		MemReader:  source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_MEM_PATH")},
-		ContReader: source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_CONT_PATH")},
-		MemWriter:  sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_MEM")),
-		ContWriter: sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CONT")),
-		ProcWriter: sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_PROC")),
-		Docker:     docker.NewManager(),
+		MemReader:     source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_MEM_PATH")},
+		ContReader:    source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_CONT_PATH")},
+		MemWriter:     sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_MEM")),
+		ContWriter:    sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CONT")),
+		ProcWriter:    sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_PROC")),
+		RssRankWriter: sink.NewValkeyRankWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_RSS_RANK")),
+		CpuRankWriter: sink.NewValkeyRankWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CPU_RANK")),
+		Docker:        docker.NewManager(),
 	}
 
 	log.Println("main: daemon iniciado")
