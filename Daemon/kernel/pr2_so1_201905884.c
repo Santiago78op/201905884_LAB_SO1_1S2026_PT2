@@ -115,10 +115,12 @@
 #define CMDLINE 256
 
 /*
- * El container_id muesta el identidicador del contenedor que esta
- * siendo ejecutado.
+ * El container_id muestra el identificador del contenedor que esta siendo ejecutado.
+ * Con systemd cgroup v2, el path completo es:
+ *   /system.slice/docker-<64chars>.scope  (~92 chars)
+ * Se usa 128 para tener margen suficiente.
 */
-#define CONTAINER_ID 64
+#define CONTAINER_ID 128
 
 /* 
  * Declaración de punteros a las entradas del sistema de archivos proc 

@@ -34,10 +34,14 @@ if lsmod | grep -q "^${MODULE_NAME}[[:space:]]"; then
 fi
 
 # 2. Compilar solo si el .ko no existe
-# [ ! -f "${KO_FILE}" ] — si el .ko no existe todavía, lo compila con make
+# El build del kernel no soporta rutas con espacios, por eso se usa un directorio temporal.
 if [ ! -f "${KO_FILE}" ]; then
     echo "[kernel-loader] compilando..."
-    make -C "${KERNEL_DIR}"
+    BUILD_TMP="$(mktemp -d /tmp/kernel_build_XXXXXX)"
+    cp "${KERNEL_DIR}"/*.c "${KERNEL_DIR}"/Makefile "${BUILD_TMP}/"
+    make -C "/lib/modules/$(uname -r)/build" M="${BUILD_TMP}" modules
+    cp "${BUILD_TMP}/${MODULE_NAME}.ko" "${KO_FILE}"
+    rm -rf "${BUILD_TMP}"
 fi
 
 # 3. Cargar el módulo
