@@ -77,3 +77,40 @@ func (v *ValkeyRankWriter) Remove(member string) error {
 	}
 	return nil
 }
+
+// ValkeyHashWriter mantiene un Hash donde field=container_name y value=JSON completo.
+// Permite que Grafana consulte HGETALL y obtenga el estado actual de cada contenedor.
+type ValkeyHashWriter struct {
+	Client *redis.Client
+	Key    string
+}
+
+func NewValkeyHashWriter(addr string, key string) *ValkeyHashWriter {
+	client := redis.NewClient(&redis.Options{
+		Addr: addr,
+	})
+	return &ValkeyHashWriter{
+		Client: client,
+		Key:    key,
+	}
+}
+
+// HSet agrega o actualiza el campo field con el valor JSON del contenedor.
+func (v *ValkeyHashWriter) HSet(field string, value any) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("valkey: error serializando hash %s: %w", field, err)
+	}
+	if err := v.Client.HSet(context.Background(), v.Key, field, b).Err(); err != nil {
+		return fmt.Errorf("valkey: hset %s[%s]: %w", v.Key, field, err)
+	}
+	return nil
+}
+
+// HDel elimina el campo del hash (cuando el contenedor es eliminado).
+func (v *ValkeyHashWriter) HDel(field string) error {
+	if err := v.Client.HDel(context.Background(), v.Key, field).Err(); err != nil {
+		return fmt.Errorf("valkey: hdel %s[%s]: %w", v.Key, field, err)
+	}
+	return nil
+}

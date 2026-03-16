@@ -53,8 +53,9 @@ type Service struct {
 	MemWriter     sink.Writer
 	ContWriter    sink.Writer
 	ProcWriter    sink.Writer // una entrada por contenedor, para Top Rankings en Grafana
-	RssRankWriter *sink.ValkeyRankWriter // sorted set por rss_kb — para ZRANGEBYSCORE sin duplicados
-	CpuRankWriter *sink.ValkeyRankWriter // sorted set por cpu_perc_x100 — para ZRANGEBYSCORE sin duplicados
+	RssRankWriter     *sink.ValkeyRankWriter // sorted set por rss_kb — para ZRANGEBYSCORE sin duplicados
+	CpuRankWriter     *sink.ValkeyRankWriter // sorted set por cpu_perc_x100 — para ZRANGEBYSCORE sin duplicados
+	ContainerHashWriter *sink.ValkeyHashWriter // hash field=name value=JSON — estado actual completo para Grafana
 	Docker        *docker.Manager
 
 	totalContainersRemoved int
@@ -166,7 +167,7 @@ func (s *Service) tick(ctx context.Context) {
 				}
 			}
 
-			// Actualizar sorted sets rss_rank y cpu_rank: estado actual sin duplicados
+			// Actualizar sorted sets y hash: estado actual sin duplicados
 			// Member = container_name (legible en Grafana), Score = métrica
 			for _, c := range result.ActiveContainers {
 				if s.RssRankWriter != nil {
@@ -179,6 +180,23 @@ func (s *Service) tick(ctx context.Context) {
 						log.Printf("service: error upsert cpu_rank %s: %v", c.ID[:12], err)
 					}
 				}
+				if s.ContainerHashWriter != nil {
+					entry := containerRankEntry{
+						DockerID:  c.ID,
+						Pid:       c.Pid,
+						Name:      c.Name,
+						Image:     c.Image,
+						Status:    "active",
+						RSSkb:     c.RSSkb,
+						VSZkb:     c.VSZkb,
+						MemPct:    c.MemPct,
+						CPURaw:    c.CPURaw,
+						Timestamp: cont.Timestamp,
+					}
+					if err := s.ContainerHashWriter.HSet(c.Name, entry); err != nil {
+						log.Printf("service: error hset containers %s: %v", c.ID[:12], err)
+					}
+				}
 			}
 			for _, c := range result.RemovedContainers {
 				if s.RssRankWriter != nil {
@@ -189,6 +207,11 @@ func (s *Service) tick(ctx context.Context) {
 				if s.CpuRankWriter != nil {
 					if err := s.CpuRankWriter.Remove(c.Name); err != nil {
 						log.Printf("service: error remove cpu_rank %s: %v", c.ID[:12], err)
+					}
+				}
+				if s.ContainerHashWriter != nil {
+					if err := s.ContainerHashWriter.HDel(c.Name); err != nil {
+						log.Printf("service: error hdel containers %s: %v", c.ID[:12], err)
 					}
 				}
 			}

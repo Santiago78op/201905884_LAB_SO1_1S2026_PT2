@@ -149,8 +149,9 @@ func main() {
 		MemWriter:     sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_MEM")),
 		ContWriter:    sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CONT")),
 		ProcWriter:    sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_PROC")),
-		RssRankWriter: sink.NewValkeyRankWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_RSS_RANK")),
-		CpuRankWriter: sink.NewValkeyRankWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CPU_RANK")),
+		RssRankWriter:       sink.NewValkeyRankWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_RSS_RANK")),
+		CpuRankWriter:       sink.NewValkeyRankWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CPU_RANK")),
+		ContainerHashWriter: sink.NewValkeyHashWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CONTAINERS")),
 		Docker:        docker.NewManager(),
 	}
 
