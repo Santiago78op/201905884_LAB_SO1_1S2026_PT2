@@ -34,19 +34,18 @@ import (
   - totalContainersRemoved: es un contador acumulativo que almacena el total de contenedores eliminados desde que inició el servicio.
 */
 // containerRankEntry es una entrada de contenedor para el ranking en Valkey/Grafana.
-// mem_perc y cpu_perc son porcentajes reales con dos decimales (ej: 0.08, 1.18).
-// cpu_perc nunca supera 100.00 aunque el kernel reporte más de un core.
+// Mantiene el formato original del kernel: mem_perc_x100 y cpu_perc_x100 como enteros.
 type containerRankEntry struct {
-	DockerID  string    `json:"docker_id"`
-	Pid       int       `json:"pid"`
-	Name      string    `json:"container_name"`
-	Image     string    `json:"image"`
-	Status    string    `json:"status"` // "active" | "removed"
-	RSSkb     uint64    `json:"rss_kb"`
-	VSZkb     uint64    `json:"vsz_kb"`
-	MemPerc   float64   `json:"mem_perc"`  // mem_perc_x100 / 100.0
-	CPUPerc   float64   `json:"cpu_perc"`  // cpu_perc_x100 / 100.0, cap 100.00
-	Timestamp time.Time `json:"timestamp"`
+	DockerID    string    `json:"docker_id"`
+	Pid         int       `json:"pid"`
+	Name        string    `json:"container_name"`
+	Image       string    `json:"image"`
+	Status      string    `json:"status"` // "active" | "removed"
+	RSSkb       uint64    `json:"rss_kb"`
+	VSZkb       uint64    `json:"vsz_kb"`
+	MemPctX100  uint64    `json:"mem_perc_x100"`
+	CPURawX100  uint64    `json:"cpu_perc_x100"`
+	Timestamp   time.Time `json:"timestamp"`
 }
 
 // toPerc convierte un valor x100 del kernel a porcentaje real, nunca mayor a 100.00.
@@ -138,37 +137,37 @@ func (s *Service) tick(ctx context.Context) {
 				log.Printf("service: error escribiendo continfo: %v", err)
 			}
 
-			// Escribir contenedores activos en procinfo para el ranking (incluye Docker ID completo)
+			// Escribir contenedores activos en procinfo (historial)
 			for _, c := range result.ActiveContainers {
 				entry := containerRankEntry{
-					DockerID:  c.ID,
-					Pid:       c.Pid,
-					Name:      c.Name,
-					Image:     c.Image,
-					Status:    "active",
-					RSSkb:     c.RSSkb,
-					VSZkb:     c.VSZkb,
-					MemPerc:   toPerc(c.MemPct),
-					CPUPerc:   toPerc(c.CPURaw),
-					Timestamp: cont.Timestamp,
+					DockerID:   c.ID,
+					Pid:        c.Pid,
+					Name:       c.Name,
+					Image:      c.Image,
+					Status:     "active",
+					RSSkb:      c.RSSkb,
+					VSZkb:      c.VSZkb,
+					MemPctX100: c.MemPct,
+					CPURawX100: c.CPURaw,
+					Timestamp:  cont.Timestamp,
 				}
 				if err := s.ProcWriter.Write(entry); err != nil {
 					log.Printf("service: error escribiendo ranking activo %s: %v", c.ID[:12], err)
 				}
 			}
-			// Escribir contenedores eliminados en este tick (incluidos en el ranking)
+			// Escribir contenedores eliminados en este tick (historial)
 			for _, c := range result.RemovedContainers {
 				entry := containerRankEntry{
-					DockerID:  c.ID,
-					Pid:       c.Pid,
-					Name:      c.Name,
-					Image:     c.Image,
-					Status:    "removed",
-					RSSkb:     c.RSSkb,
-					VSZkb:     c.VSZkb,
-					MemPerc:   toPerc(c.MemPct),
-					CPUPerc:   toPerc(c.CPURaw),
-					Timestamp: cont.Timestamp,
+					DockerID:   c.ID,
+					Pid:        c.Pid,
+					Name:       c.Name,
+					Image:      c.Image,
+					Status:     "removed",
+					RSSkb:      c.RSSkb,
+					VSZkb:      c.VSZkb,
+					MemPctX100: c.MemPct,
+					CPURawX100: c.CPURaw,
+					Timestamp:  cont.Timestamp,
 				}
 				if err := s.ProcWriter.Write(entry); err != nil {
 					log.Printf("service: error escribiendo ranking eliminado %s: %v", c.ID[:12], err)
@@ -176,35 +175,33 @@ func (s *Service) tick(ctx context.Context) {
 			}
 
 			// Actualizar sorted sets y hash: estado actual sin duplicados
-			// Sorted sets usan porcentaje real como score (pie charts en Grafana)
+			// Hash keyed por docker_id → unicidad garantizada
+			// Sorted sets usan container_name como member y toPerc() como score
 			for _, c := range result.ActiveContainers {
-				memPerc := toPerc(c.MemPct)
-				cpuPerc := toPerc(c.CPURaw)
-
 				if s.RssRankWriter != nil {
-					if err := s.RssRankWriter.Upsert(memPerc, c.Name); err != nil {
+					if err := s.RssRankWriter.Upsert(toPerc(c.MemPct), c.Name); err != nil {
 						log.Printf("service: error upsert rss_rank %s: %v", c.ID[:12], err)
 					}
 				}
 				if s.CpuRankWriter != nil {
-					if err := s.CpuRankWriter.Upsert(cpuPerc, c.Name); err != nil {
+					if err := s.CpuRankWriter.Upsert(toPerc(c.CPURaw), c.Name); err != nil {
 						log.Printf("service: error upsert cpu_rank %s: %v", c.ID[:12], err)
 					}
 				}
 				if s.ContainerHashWriter != nil {
 					entry := containerRankEntry{
-						DockerID:  c.ID,
-						Pid:       c.Pid,
-						Name:      c.Name,
-						Image:     c.Image,
-						Status:    "active",
-						RSSkb:     c.RSSkb,
-						VSZkb:     c.VSZkb,
-						MemPerc:   memPerc,
-						CPUPerc:   cpuPerc,
-						Timestamp: cont.Timestamp,
+						DockerID:   c.ID,
+						Pid:        c.Pid,
+						Name:       c.Name,
+						Image:      c.Image,
+						Status:     "active",
+						RSSkb:      c.RSSkb,
+						VSZkb:      c.VSZkb,
+						MemPctX100: c.MemPct,
+						CPURawX100: c.CPURaw,
+						Timestamp:  cont.Timestamp,
 					}
-					if err := s.ContainerHashWriter.HSet(c.Name, entry); err != nil {
+					if err := s.ContainerHashWriter.HSet(c.ID, entry); err != nil {
 						log.Printf("service: error hset containers %s: %v", c.ID[:12], err)
 					}
 				}
@@ -221,7 +218,7 @@ func (s *Service) tick(ctx context.Context) {
 					}
 				}
 				if s.ContainerHashWriter != nil {
-					if err := s.ContainerHashWriter.HDel(c.Name); err != nil {
+					if err := s.ContainerHashWriter.HDel(c.ID); err != nil {
 						log.Printf("service: error hdel containers %s: %v", c.ID[:12], err)
 					}
 				}
