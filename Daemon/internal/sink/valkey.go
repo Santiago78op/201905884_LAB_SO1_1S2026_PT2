@@ -82,7 +82,7 @@ func (v *ValkeyRankWriter) Remove(member string) error {
 // Permite que Grafana consulte HGETALL y obtenga el estado actual de cada contenedor.
 type ValkeyHashWriter struct {
 	Client *redis.Client
-	Key    string
+	Key    string // key en Valkey, "containers"
 }
 
 func NewValkeyHashWriter(addr string, key string) *ValkeyHashWriter {
@@ -97,10 +97,11 @@ func NewValkeyHashWriter(addr string, key string) *ValkeyHashWriter {
 
 // HSet agrega o actualiza el campo field con el valor JSON del contenedor.
 func (v *ValkeyHashWriter) HSet(field string, value any) error {
-	b, err := json.Marshal(value)
+	b, err := json.Marshal(value) // serializar el valor a JSON
 	if err != nil {
 		return fmt.Errorf("valkey: error serializando hash %s: %w", field, err)
 	}
+	// HSet actualiza el campo del hash con el JSON serializado
 	if err := v.Client.HSet(context.Background(), v.Key, field, b).Err(); err != nil {
 		return fmt.Errorf("valkey: hset %s[%s]: %w", v.Key, field, err)
 	}
