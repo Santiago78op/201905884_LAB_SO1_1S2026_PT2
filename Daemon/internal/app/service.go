@@ -38,6 +38,7 @@ import (
 type containerRankEntry struct {
 	DockerID   string    `json:"docker_id"`
 	Pid        int       `json:"pid"`
+	Cmdline    string    `json:"cmdline"`
 	Name       string    `json:"container_name"`
 	Image      string    `json:"image"`
 	Status     string    `json:"status"` // "active" | "removed"
@@ -142,13 +143,14 @@ func (s *Service) tick(ctx context.Context) {
 				entry := containerRankEntry{
 					DockerID:   c.ID,
 					Pid:        c.Pid,
+					Cmdline:    c.Cmdline,
 					Name:       c.Name,
 					Image:      c.Image,
 					Status:     "active",
 					RSSkb:      c.RSSkb,
 					VSZkb:      c.VSZkb,
-					MemPctX100: c.MemPct,
-					CPURawX100: c.CPURaw,
+					MemPctX100: uint64(toPerc(c.MemPct)),
+					CPURawX100: uint64(toPerc(c.CPURaw)),
 					Timestamp:  cont.Timestamp,
 				}
 				if err := s.ProcWriter.Write(entry); err != nil {
@@ -160,13 +162,14 @@ func (s *Service) tick(ctx context.Context) {
 				entry := containerRankEntry{
 					DockerID:   c.ID,
 					Pid:        c.Pid,
+					Cmdline:    c.Cmdline,
 					Name:       c.Name,
 					Image:      c.Image,
 					Status:     "removed",
 					RSSkb:      c.RSSkb,
 					VSZkb:      c.VSZkb,
-					MemPctX100: c.MemPct,
-					CPURawX100: c.CPURaw,
+					MemPctX100: uint64(toPerc(c.MemPct)),
+					CPURawX100: uint64(toPerc(c.CPURaw)),
 					Timestamp:  cont.Timestamp,
 				}
 				if err := s.ProcWriter.Write(entry); err != nil {
@@ -192,13 +195,14 @@ func (s *Service) tick(ctx context.Context) {
 					entry := containerRankEntry{
 						DockerID:   c.ID,
 						Pid:        c.Pid,
+						Cmdline:    c.Cmdline,
 						Name:       c.Name,
 						Image:      c.Image,
 						Status:     "active",
 						RSSkb:      c.RSSkb,
 						VSZkb:      c.VSZkb,
-						MemPctX100: c.MemPct,
-						CPURawX100: c.CPURaw,
+						MemPctX100: uint64(toPerc(c.MemPct)),
+						CPURawX100: uint64(toPerc(c.CPURaw)),
 						Timestamp:  cont.Timestamp,
 					}
 					if err := s.ContainerHashWriter.HSet(c.ID, entry); err != nil {

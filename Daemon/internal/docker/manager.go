@@ -16,7 +16,7 @@ import (
 type Category int
 
 const (
-	CategorySystem         Category = iota // grafana, valkey — nunca tocar
+	CategorySystem          Category = iota // grafana, valkey — nunca tocar
 	CategoryLowConsumption                  // alpine sleep 240
 	CategoryHighConsumption                 // go-client o alpine stress
 	CategoryUnknown
@@ -34,6 +34,7 @@ type Container struct {
 	Image    string
 	Command  string
 	Name     string
+	Cmdline  string // Command + Args para mejor identificación en Grafana
 	Category Category
 	// Métricas desde /proc/continfo (enriquecidas en Enforce)
 	Pid    int
