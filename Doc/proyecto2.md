@@ -6,41 +6,53 @@
 ## 1. Arquitectura General
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        KERNEL SPACE                         │
-│                                                             │
-│  pr2_so1_201905884.ko                                       │
-│  ├── /proc/meminfo_pr2_so1_201905884  → JSON RAM stats      │
-│  └── /proc/continfo_pr2_so1_201905884 → JSON procesos       │
-└────────────────────────┬────────────────────────────────────┘
-                         │ polling cada 5s
-┌────────────────────────▼────────────────────────────────────┐
-│                       USER SPACE (Go daemon)                │
-│                                                             │
-│  Arranque:                                                  │
-│  ├── godotenv.Load()      → carga .env                      │
-│  ├── docker compose up -d → levanta Grafana + Valkey        │
-│  └── kernel.Load()        → insmod via script bash          │
-│                                                             │
-│  Loop cada 5s:                                              │
-│  ├── source.FileReader    → lee /proc                       │
-│  ├── parser.ParseMemInfo  → JSON → model.MemStats           │
-│  ├── parser.ParseContInfo → JSON → model.ContainerReport    │
-│  └── sink.ValkeyWriter    → RPUSH meminfo / continfo        │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────────┐
-│                  DOCKER COMPOSE                             │
-│                                                             │
-│  valkey_so1  (puerto 6379)                                  │
-│  ├── lista: meminfo   → entradas JSON de RAM                │
-│  └── lista: continfo  → entradas JSON de contenedores       │
-│                                                             │
-│  grafana_so1 (puerto 3000)                                  │
-│  ├── plugin: redis-datasource                               │
-│  ├── datasource: Valkey (redis://valkey:6379)               │
-│  └── visualizacion: http://localhost:3000                   │
-└─────────────────────────────────────────────────────────────┘
+╔══════════════════════════════════════════════════════════════════════╗
+║                          KERNEL SPACE                               ║
+║                                                                      ║
+║   pr2_so1_201905884.ko                                               ║
+║   ├── /proc/meminfo_pr2_so1_201905884   → JSON  { memory_info: … }  ║
+║   └── /proc/continfo_pr2_so1_201905884  → JSON  { processes: […] }  ║
+╚══════════════════════════════╦═══════════════════════════════════════╝
+                               ║  polling aleatorios 20-60s
+╔══════════════════════════════╩═══════════════════════════════════════╗
+║                       USER SPACE — Go daemon                        ║
+║                                                                      ║
+║  ARRANQUE (una sola vez):                                            ║
+║  ├── godotenv.Load()           → carga variables desde .env         ║
+║  ├── docker compose up -d      → levanta Grafana + Valkey           ║
+║  ├── kernel.Load()             → insmod via script bash             ║
+║  └── app.RegisterCronjob()     → crea entrada crontab (*/2 min)     ║
+║                                                                      ║
+║  LOOP (cada 20-60 s aleatorios):                                     ║
+║  ├── source.FileReader.Read()  → []byte JSON crudo de /proc         ║
+║  ├── parser.ParseMemInfo()     → model.MemStats                     ║
+║  ├── parser.ParseContInfo()    → model.ContainerReport              ║
+║  ├── docker.Manager.Enforce()  → aplica invariantes (3 low + 2 high)║
+║  └── sink.ValkeyWriter         → escribe en 6 claves de Valkey      ║
+║      ├── RPUSH meminfo         → historial RAM                      ║
+║      ├── RPUSH continfo        → historial contenedores             ║
+║      ├── RPUSH procinfo        → historial por contenedor           ║
+║      ├── ZADD  rss_rank        → ranking RAM actual (sorted set)    ║
+║      ├── ZADD  cpu_rank        → ranking CPU actual (sorted set)    ║
+║      └── HSET  containers      → estado actual por ID (hash)        ║
+╚══════════════════════════════╦═══════════════════════════════════════╝
+                               ║
+╔══════════════════════════════╩═══════════════════════════════════════╗
+║                       DOCKER COMPOSE                                ║
+║                                                                      ║
+║  valkey_so1  (puerto 6379)                                           ║
+║  ├── lista:       meminfo    → entradas JSON de RAM en orden        ║
+║  ├── lista:       continfo   → resumen de contenedores activos      ║
+║  ├── lista:       procinfo   → métricas por contenedor (historial)  ║
+║  ├── sorted-set:  rss_rank   → ranking por RSS (sin duplicados)     ║
+║  ├── sorted-set:  cpu_rank   → ranking por CPU (sin duplicados)     ║
+║  └── hash:        containers → estado actual por docker_id          ║
+║                                                                      ║
+║  grafana_so1 (puerto 3000)                                           ║
+║  ├── plugin:      redis-datasource  (valkey es protocolo Redis)     ║
+║  ├── datasource:  redis://valkey:6379                               ║
+║  └── acceso:      http://localhost:3000  (admin / admin)            ║
+╚══════════════════════════════════════════════════════════════════════╝
 ```
 
 ---
@@ -50,585 +62,738 @@
 ```
 201905884_LAB_SO1_1S2026_PT2/
 ├── Doc/
-│   └── proyecto2.md
+│   └── proyecto2.md                        ← este archivo
 ├── Enunciado/
 │   └── Proyecto2.pdf
 └── Daemon/
-    ├── cmd/daemon/main.go             # entrada del daemon
+    ├── cmd/daemon/
+    │   ├── main.go                         ← entry-point: arranque + señales OS
+    │   └── .env                            ← variables de entorno
     ├── internal/
-    │   ├── kernel/loader.go           # carga modulo via script
-    │   ├── app/service.go             # loop principal
-    │   ├── model/metrics.go           # structs de datos
-    │   ├── parser/meminfo.go          # JSON /proc → MemStats
-    │   ├── parser/continfo.go         # JSON /proc → ContainerReport
-    │   ├── sink/jsonfile.go           # escritura en archivo (legacy)
-    │   ├── sink/valkey.go             # escritura en Valkey (activo)
-    │   └── source/file_reader.go     # lectura de /proc
+    │   ├── kernel/loader.go                ← Load() / Unload() via script bash
+    │   ├── app/service.go                  ← loop principal + tick()
+    │   ├── app/cronjob.go                  ← RegisterCronjob / RemoveCronjob
+    │   ├── model/metrics.go                ← structs: MemStats, ContainerReport
+    │   ├── parser/meminfo.go               ← JSON /proc → model.MemStats
+    │   ├── parser/continfo.go              ← JSON /proc → model.ContainerReport
+    │   ├── sink/valkey.go                  ← ValkeyWriter / RankWriter / HashWriter
+    │   ├── sink/jsonfile.go                ← escritura en archivo (legacy)
+    │   ├── source/file_reader.go           ← FileReader: lee /proc con contexto
+    │   └── docker/manager.go               ← Manager.Enforce(): ciclo de vida
     ├── docker/
-    │   ├── docker-compose.yml         # Grafana + Valkey
+    │   ├── docker-compose.yml              ← Grafana + Valkey en red compartida
     │   └── grafana/provisioning/
-    │       └── datasources/valkey.yml # datasource preconfigurado
+    │       └── datasources/valkey.yml      ← datasource Valkey preconfigurado
     ├── kernel/
-    │   ├── pr2_so1_201905884.c
+    │   ├── pr2_so1_201905884.c             ← módulo del kernel
     │   └── Makefile
     ├── scripts/
-    │   └── load_kernel_module.sh
-    ├── doc/
-    │   └── Daemon.md
-    ├── .env
+    │   ├── load_kernel_module.sh           ← compila + insmod + verifica /proc
+    │   ├── unload_kernel_module.sh         ← rmmod
+    │   └── create_containers.sh            ← ejecutado por el cronjob cada 2 min
+    ├── doc/Daemon.md
     ├── go.mod
     └── go.sum
 ```
 
 ---
+## 3. Módulo de Kernel
 
-## 3. Módulo Kernel
+### 3.1 ¿Qué hace el módulo?
 
-### 3.1 Entradas /proc creadas
+El módulo de kernel `pr2_so1_201905884.ko` es un LKM (Loadable Kernel Module) escrito en C que:
 
-| Entrada | Contenido |
-|---|---|
-| `/proc/meminfo_pr2_so1_201905884` | RAM total, libre y usada en MB |
-| `/proc/continfo_pr2_so1_201905884` | Lista de procesos Docker/containerd + métricas |
+1. Se registra en `/proc` al cargarse (`insmod`) creando dos entradas virtuales de solo lectura.
+2. Lee información de la memoria del sistema via `si_meminfo()` al leer `/proc/meminfo_*`.
+3. Itera sobre todos los procesos del sistema via `for_each_process` al leer `/proc/continfo_*`.
+4. Para cada proceso, usa `get_task_mm()` para obtener métricas de memoria (VSZ, RSS).
+5. Identifica si un proceso pertenece a un contenedor Docker leyendo su cgroup v2 path.
+6. Serializa toda la información como JSON y la expone a espacio de usuario.
 
-### 3.2 Formato de salida
+### 3.2 Entradas /proc creadas
+
+| Entrada | Tipo | Contenido |
+|---|---|---|
+| `/proc/meminfo_pr2_so1_201905884` | Virtual (read-only) | JSON con RAM total, libre y usada en KB |
+| `/proc/continfo_pr2_so1_201905884` | Virtual (read-only) | JSON con lista de procesos + métricas + docker_active |
+
+### 3.3 Formato JSON de salida
 
 **`/proc/meminfo_pr2_so1_201905884`**
-```
-RAM_TOTAL_MB=7974
-RAM_FREE_MB=3200
-RAM_USED_MB=4774
+```json
+{
+  "memory_info": {
+    "total_ram_kb": 8157520,
+    "free_ram_kb":  3200000,
+    "used_ram_kb":  4957520
+  }
+}
 ```
 
 **`/proc/continfo_pr2_so1_201905884`**
-```
-container_id=abc123def456
-PID    NAME              VSZ_(KB)   RSS_(KB)   %MEM_PCT   %CPU_RAW   CONTAINER_ID
-1234   dockerd           102400     51200      1          9876543    -
-5678   containerd        204800     102400     2          1234567    abc123def456
-CONTAINERS_ACTIVE=1
-```
-
-### 3.3 Parámetros del módulo
-
-```bash
-# Cargar sin filtro de contenedor (solo procesos generales)
-sudo insmod pr2_so1_201905884.ko
-
-# Cargar filtrando por container ID específico
-sudo insmod pr2_so1_201905884.ko container_id="abc123def456"
-```
-
-### 3.4 Comandos de build y prueba
-
-```bash
-cd Kernel
-make                                        # compilar
-sudo insmod pr2_so1_201905884.ko            # cargar módulo
-cat /proc/meminfo_pr2_so1_201905884        # verificar RAM
-cat /proc/continfo_pr2_so1_201905884       # verificar procesos
-dmesg | tail -5                             # ver logs del kernel
-sudo rmmod pr2_so1_201905884               # descargar módulo
-make clean                                  # limpiar binarios
-```
-
-### 3.5 Decisiones técnicas del módulo
-
-| Elemento | Decisión | Razón |
-|---|---|---|
-| `seq_file` + `single_open` | Para exponer datos en `/proc` | API estable del kernel para archivos `/proc` read-only |
-| `si_meminfo()` | Para obtener RAM | Función exportada del kernel, segura y precisa |
-| `proc_ops` | En lugar de `file_operations` | Requerido en kernels >= 5.6 |
-| `GFP_ATOMIC` | En kmalloc dentro del loop | No puede dormirse dentro de `rcu_read_lock` |
-| `get_task_mm()` + `mmput()` | Para acceder a `task->mm` | Evita race condition si el proceso termina |
-| `rcu_read_lock/unlock` | Alrededor de `for_each_process` | `list_entry_rcu` requiere protección RCU |
-| `css_put()` | Después de `task_get_css()` | Libera la referencia y evita memory leak |
-| `cgroup_path() == 0` | Check de retorno | En kernels 5.x+ retorna 0 en éxito, no positivo |
-
-### 3.6 Bugs corregidos
-
-| # | Bug | Fix |
-|---|---|---|
-| 1 | `css_put()` faltante → reference leak | Agregado después de usar `css` |
-| 2 | `cgroup_path() > 0` nunca verdadero | Cambiado a `== 0` |
-| 3 | `kmalloc(GFP_KERNEL)` dentro de RCU | Cambiado a `GFP_ATOMIC` |
-| 4 | `for_each_process` sin RCU lock | Agregado `rcu_read_lock/unlock` |
-| 5 | `task->mm` sin locking | Reemplazado por `get_task_mm()` + `mmput()` |
-| 6 | Doble llamada a `task_in_container_by_cgroup2` | Variable `in_cgroup` reutilizada |
-| 7 | Formato incorrecto (KB, texto libre) | Ahora `RAM_*_MB=` en MB |
-| 8 | `containers_active` dentro del loop | Movido al inicio de la función |
-| 9 | `CONTAINERS_ACTIVE` impreso antes de contar | Movido después de `rcu_read_unlock()` |
-| 10 | `rcu_read_lock()` duplicado al final | Corregido a `rcu_read_unlock()` |
-
----
-
-## 4. Daemon (Go)
-
-### 4.1 Dependencias
-
-```bash
-# Instalar Go (si no está instalado)
-sudo apt install golang-go       # Debian/Ubuntu
-sudo pacman -S go                # Arch
-
-# Desde Daemon/ — instalar dependencias
-go get github.com/redis/go-redis/v9
-go get github.com/joho/godotenv
-```
-
-### 4.2 Estructura JSON generada
-
 ```json
 {
-  "timestamp": "2026-02-28T12:34:56Z",
-  "ram": {
-    "total_mb": 7974,
-    "free_mb": 3200,
-    "used_mb": 4774
-  },
-  "containers_active": 1,
-  "container_id": "abc123def456",
   "processes": [
     {
       "pid": 1234,
-      "name": "dockerd",
+      "name": "containerd-shim",
+      "cmdline": "containerd-shim-runc-v2 -namespace moby -id abc123def456",
       "vsz_kb": 102400,
       "rss_kb": 51200,
-      "mem_pct": 1,
-      "cpu_ticks": 9876543,
-      "in_container": false
-    },
-    {
-      "pid": 5678,
-      "name": "containerd",
-      "vsz_kb": 204800,
-      "rss_kb": 102400,
-      "mem_pct": 2,
-      "cpu_ticks": 1234567,
-      "in_container": true
+      "mem_perc_x100": 63,
+      "cpu_perc_x100": 412,
+      "container_id": "abc123def456"
     }
-  ]
+  ],
+  "docker_active": 5
 }
 ```
 
-### 4.3 Structs Go
+> **Nota sobre `*_perc_x100`:** el kernel no puede usar `float`. Los valores son enteros que representan
+> el porcentaje multiplicado por 100. Ejemplo: `63` significa `0.63 %`. Los valores se almacenan tal cual en Valkey;
+> la conversión a porcentaje real (dividiendo por 100) ocurre al configurar los paneles en Grafana.
 
-```go
-type MemInfo struct {
-    TotalMB uint64 `json:"total_mb"`
-    FreeMB  uint64 `json:"free_mb"`
-    UsedMB  uint64 `json:"used_mb"`
-}
+### 3.4 Headers del kernel utilizados
 
-type ProcessInfo struct {
-    PID         int    `json:"pid"`
-    Name        string `json:"name"`
-    VSZKB       uint64 `json:"vsz_kb"`
-    RSSKB       uint64 `json:"rss_kb"`
-    MemPct      uint64 `json:"mem_pct"`
-    CPUTicks    uint64 `json:"cpu_ticks"`
-    InContainer bool   `json:"in_container"`
-}
-
-type ContInfo struct {
-    ContainersActive int
-    ContainerID      string
-    Processes        []ProcessInfo
-}
-
-type Telemetry struct {
-    Timestamp        string        `json:"timestamp"`
-    RAM              MemInfo       `json:"ram"`
-    ContainersActive int           `json:"containers_active"`
-    ContainerID      string        `json:"container_id"`
-    Processes        []ProcessInfo `json:"processes"`
-}
-```
-
-### 4.4 Archivos del daemon
-
-#### `main.go` — Entry point y loop principal
-
-```go
-package main
-
-import (
-    "encoding/json"
-    "fmt"
-    "log"
-    "os"
-    "time"
-)
-
-const (
-    procMeminfo  = "/proc/meminfo_pr2_so1_201905884"
-    procContinfo = "/proc/continfo_pr2_so1_201905884"
-    logDir       = "/var/log/proyecto2"
-    logFile      = logDir + "/telemetria.log"
-    intervalSec  = 5
-)
-
-type Telemetry struct {
-    Timestamp        string        `json:"timestamp"`
-    RAM              MemInfo       `json:"ram"`
-    ContainersActive int           `json:"containers_active"`
-    ContainerID      string        `json:"container_id"`
-    Processes        []ProcessInfo `json:"processes"`
-}
-
-func main() {
-    ensureLogDir()
-    fmt.Printf("[daemon] iniciado — intervalo %ds\n", intervalSec)
-
-    for {
-        ts := time.Now().UTC().Format(time.RFC3339)
-
-        mem, err := readMemInfo()
-        if err != nil {
-            log.Printf("[daemon] error leyendo meminfo: %v", err)
-        }
-
-        cont, err := readContInfo()
-        if err != nil {
-            log.Printf("[daemon] error leyendo continfo: %v", err)
-        }
-
-        t := Telemetry{
-            Timestamp:        ts,
-            RAM:              mem,
-            ContainersActive: cont.ContainersActive,
-            ContainerID:      cont.ContainerID,
-            Processes:        cont.Processes,
-        }
-
-        data, err := json.Marshal(t)
-        if err != nil {
-            log.Printf("[daemon] error serializando JSON: %v", err)
-            time.Sleep(intervalSec * time.Second)
-            continue
-        }
-
-        writeLog(string(data))
-        pushToValkey(string(data))
-
-        fmt.Printf("[daemon] %s — RAM usada: %dMB — containers: %d\n",
-            ts, mem.UsedMB, cont.ContainersActive)
-
-        time.Sleep(intervalSec * time.Second)
-    }
-}
-
-func ensureLogDir() {
-    if err := os.MkdirAll(logDir, 0755); err != nil {
-        log.Fatalf("[daemon] no se pudo crear %s: %v", logDir, err)
-    }
-}
-
-func writeLog(jsonStr string) {
-    f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-    if err != nil {
-        log.Printf("[daemon] no se pudo abrir log: %v", err)
-        return
-    }
-    defer f.Close()
-    fmt.Fprintln(f, jsonStr)
-}
-```
-
-#### `proc.go` — Parseo de /proc
-
-```go
-package main
-
-import (
-	"bufio"
-	"os"
-	"strconv"
-	"strings"
-)
-
-// ── Structs ──────────────────────────────────────────────────
-
-type MemInfo struct {
-	TotalMB uint64 `json:"total_mb"`
-	FreeMB  uint64 `json:"free_mb"`
-	UsedMB  uint64 `json:"used_mb"`
-}
-
-type ProcessInfo struct {
-	PID         int    `json:"pid"`
-	Name        string `json:"name"`
-	VSZKB       uint64 `json:"vsz_kb"`
-	RSSKB       uint64 `json:"rss_kb"`
-	MemPct      uint64 `json:"mem_pct"`
-	CPUTicks    uint64 `json:"cpu_ticks"`
-	InContainer bool   `json:"in_container"`
-}
-
-type ContInfo struct {
-	ContainersActive int
-	ContainerID      string
-	Processes        []ProcessInfo
-}
-
-// ── readMemInfo ──────────────────────────────────────────────
-
-func readMemInfo() (MemInfo, error) {
-	var mem MemInfo
-
-	f, err := os.Open(procMeminfo)
-	if err != nil {
-		return mem, err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Cada línea es KEY=VALUE — dividir por el primer "="
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		key := strings.TrimSpace(parts[0])
-		val, err := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 64)
-		if err != nil {
-			continue
-		}
-
-		switch key {
-		case "RAM_TOTAL_MB":
-			mem.TotalMB = val
-		case "RAM_FREE_MB":
-			mem.FreeMB = val
-		case "RAM_USED_MB":
-			mem.UsedMB = val
-		}
-	}
-
-	return mem, scanner.Err()
-}
-
-// ── readContInfo ─────────────────────────────────────────────
-
-func readContInfo() (ContInfo, error) {
-	cont := ContInfo{
-		Processes: []ProcessInfo{},
-	}
-
-	f, err := os.Open(procContinfo)
-	if err != nil {
-		return cont, err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// 1) CONTAINERS_ACTIVE=N  (al final del archivo)
-		if strings.HasPrefix(line, "CONTAINERS_ACTIVE=") {
-			val, err := strconv.Atoi(strings.TrimPrefix(line, "CONTAINERS_ACTIVE="))
-			if err == nil {
-				cont.ContainersActive = val
-			}
-			continue
-		}
-
-		// 2) container_id=...
-		if strings.HasPrefix(line, "container_id=") {
-			cont.ContainerID = strings.TrimPrefix(line, "container_id=")
-			continue
-		}
-
-		// 3) Encabezado — ignorar
-		if strings.HasPrefix(line, "PID") {
-			continue
-		}
-
-		// 4) Línea de proceso — separada por whitespace (tabs)
-		//    Formato: PID NAME VSZ RSS MEM_PCT CPU_TICKS CID
-		fields := strings.Fields(line)
-		if len(fields) < 7 {
-			continue
-		}
-
-		pid, err := strconv.Atoi(fields[0])
-		if err != nil {
-			continue
-		}
-
-		vsz, _      := strconv.ParseUint(fields[2], 10, 64)
-		rss, _      := strconv.ParseUint(fields[3], 10, 64)
-		memPct, _   := strconv.ParseUint(fields[4], 10, 64)
-		cpuTicks, _ := strconv.ParseUint(fields[5], 10, 64)
-		inContainer := fields[6] != "-"
-
-		cont.Processes = append(cont.Processes, ProcessInfo{
-			PID:         pid,
-			Name:        fields[1],
-			VSZKB:       vsz,
-			RSSKB:       rss,
-			MemPct:      memPct,
-			CPUTicks:    cpuTicks,
-			InContainer: inContainer,
-		})
-	}
-
-	return cont, scanner.Err()
-}
-```
-
-**Por qué funciona así:**
-
-| Decisión | Razón |
+| Header | Propósito |
 |---|---|
-| `bufio.Scanner` | Lee línea a línea sin cargar todo el archivo en memoria |
-| `strings.SplitN(line, "=", 2)` | Divide solo en el primer `=`, seguro si el valor contiene `=` |
-| `strings.Fields(line)` | Divide por cualquier whitespace (tabs y espacios), compatible con el TSV del kernel |
-| `fields[6] != "-"` | El módulo escribe `"-"` cuando el proceso no pertenece al contenedor |
-| `Processes: []ProcessInfo{}` | Inicializar slice vacío garantiza que el JSON serializa `[]` en lugar de `null` |
+| `linux/proc_fs.h` + `linux/seq_file.h` | API estable para crear archivos `/proc` secuenciales |
+| `linux/mmzone.h` | `si_meminfo()` — estadísticas globales de RAM |
+| `linux/mm.h` | `get_task_mm()` / `mmput()` — acceso seguro a memoria de proceso |
+| `linux/sched/signal.h` | `for_each_process` — iteración sobre tabla de procesos |
+| `linux/cgroup.h` | `cgroup_path()` — ruta del cgroup v2 del proceso |
+| `linux/slab.h` | `kmalloc(GFP_ATOMIC)` / `kfree` — memoria dinámica del kernel |
+| `linux/mmap_lock.h` | `mmap_read_lock/unlock` — protección del espacio de memoria |
 
-#### `valkey.go` — Inserción en Valkey
+### 3.5 Decisiones técnicas clave
+
+| Elemento | Decisión | Razón |
+|---|---|---|
+| `seq_file` + `single_open` | Exponer datos en `/proc` | API estable para archivos read-only del kernel |
+| `si_meminfo()` | Obtener estadísticas de RAM | Función pública del kernel, precisa y segura |
+| `proc_ops` | En vez de `file_operations` | Obligatorio en kernels >= 5.6 |
+| `GFP_ATOMIC` en `kmalloc` | Dentro del loop de procesos | No puede dormirse dentro de `rcu_read_lock` |
+| `get_task_mm()` + `mmput()` | Acceder a `task->mm` | Evita race condition si el proceso termina |
+| `rcu_read_lock/unlock` | Alrededor de `for_each_process` | `list_entry_rcu` requiere protección RCU |
+| `*_perc_x100` como `uint64` | En vez de float | El kernel prohíbe float en espacio kernel |
+| JSON como formato de salida | En vez de texto plano | Elimina la necesidad de un parser personalizado en Go |
+
+### 3.6 Comandos de build y prueba
+
+```bash
+cd Daemon/kernel
+
+# Compilar (requiere linux-headers instalados)
+make
+
+# Cargar módulo en el kernel
+sudo insmod pr2_so1_201905884.ko
+
+# Verificar las entradas /proc
+cat /proc/meminfo_pr2_so1_201905884
+cat /proc/continfo_pr2_so1_201905884
+
+# Ver logs del kernel
+dmesg | tail -10
+
+# Descargar módulo
+sudo rmmod pr2_so1_201905884
+
+# Limpiar binarios
+make clean
+```
+
+---
+## 4. El Daemon — Proceso Completo
+
+### 4.1 Descripción General
+
+El daemon es un proceso en segundo plano (background) escrito en Go que:
+
+- **No tiene interfaz de usuario**: se ejecuta con `sudo` y corre indefinidamente.
+- **Orquesta todo el sistema**: carga el kernel, levanta Docker, registra el cron y hace polling de `/proc`.
+- **Responde a señales del OS**: `SIGINT` (Ctrl+C) y `SIGTERM` inician un shutdown limpio.
+- **Intervalo aleatorio**: espera entre 20 y 60 segundos entre ciclos.
+
+### 4.2 Arranque paso a paso
+
+```
+main()
+  │
+  ├─ 1. godotenv.Load()
+  │      Lee Daemon/cmd/daemon/.env
+  │      Carga variables: rutas de scripts, claves Valkey, puertos, etc.
+  │
+  ├─ 2. kernel.Load(LoadOpts{ScriptPath: ...})
+  │      Ejecuta scripts/load_kernel_module.sh via /bin/bash
+  │      El script: compila el .ko → insmod → verifica /proc
+  │      Si falla → log.Fatalf (el daemon no arranca sin el módulo)
+  │      defer kernel.Unload() se ejecutará al terminar el daemon
+  │
+  ├─ 3. exec.Command(docker compose up -d)
+  │      Levanta valkey_so1 y grafana_so1 en red compartida red_pr2_so1
+  │      Si falla → log.Fatalf
+  │
+  ├─ 4. app.RegisterCronjob(cronScript)
+  │      Agrega '*/2 * * * * /abs/path/create_containers.sh' al crontab
+  │      El script crea 5 contenedores aleatorios cada 2 minutos
+  │      Idempotente: no duplica si ya existe la entrada
+  │
+  ├─ 5. signal.Notify(sigChan, SIGINT, SIGTERM)
+  │      goroutine: espera señal → cancel() → ctx.Done() se cierra
+  │
+  └─ 6. svc.Run(ctx)
+         Loop infinito (ver sección 4.3)
+```
+
+### 4.3 El Loop Principal — `service.Run()`
+
+```
+Run(ctx):
+  loop:
+    wait = random(20s … 60s)
+    select:
+      case ctx.Done():        → retorna nil (shutdown limpio)
+      case time.After(wait):  → tick(ctx)
+```
+
+Cada tick ejecuta:
+
+```
+tick(ctx):
+  │
+  ├─ A. Leer memoria
+  │      FileReader.Read('/proc/meminfo_pr2_so1_201905884')
+  │        → []byte (JSON crudo del kernel)
+  │      parser.ParseMemInfo(raw)
+  │        → model.MemStats{ MemTotal, MemFree, MemUsed, Timestamp }
+  │      ValkeyWriter.Write(mem)
+  │        → RPUSH meminfo <json>
+  │
+  ├─ B. Leer contenedores
+  │      FileReader.Read('/proc/continfo_pr2_so1_201905884')
+  │        → []byte (JSON crudo del kernel)
+  │      parser.ParseContInfo(raw)
+  │        → model.ContainerReport{ Processes[], ContainersActive }
+  │
+  ├─ C. Aplicar invariantes (Docker.Enforce)
+  │      list() → docker ps (contenedores activos)
+  │      enrichWithMetrics() → vincula métricas del kernel a cada contenedor
+  │      Si hay exceso de bajo consumo → stopAndRemove los de mayor consumo
+  │      Si hay exceso de alto consumo → stopAndRemove los de menor consumo
+  │      Si faltan bajos → createLow() (alpine sleep 240)
+  │      Si faltan altos → createHigh() (go-client o alpine stress)
+  │      Retorna EnforceResult{ Active[], Removed[], Counts }
+  │
+  └─ D. Persistir en Valkey (6 claves)
+         ContWriter.Write(cont)       → RPUSH continfo <json>
+         ProcWriter.Write(entry)      → RPUSH procinfo <json> (uno por contenedor)
+         RssRankWriter.Upsert()       → ZADD rss_rank score=memPct% member=name
+         CpuRankWriter.Upsert()       → ZADD cpu_rank score=cpuPct% member=name
+         ContainerHashWriter.HSet()   → HSET containers <docker_id> <json>
+         (cuando se elimina un contenedor)
+         RssRankWriter.Remove()       → ZREM rss_rank member
+         CpuRankWriter.Remove()       → ZREM cpu_rank member
+         ContainerHashWriter.HDel()   → HDEL containers <docker_id>
+```
+
+### 4.4 Shutdown Limpio
+
+Cuando el daemon recibe `SIGINT` o `SIGTERM`:
+
+1. La goroutine de señales llama a `cancel()`.
+2. `ctx.Done()` se cierra → `svc.Run()` retorna `nil` en la próxima iteración del select.
+3. `app.RemoveCronjob()` elimina la entrada del crontab del sistema.
+4. `defer kernel.Unload()` ejecuta `scripts/unload_kernel_module.sh` → `rmmod`.
+5. `main()` retorna y el proceso termina limpiamente.
+
+### 4.5 Variables de Entorno (.env)
+
+| Variable | Valor por defecto | Descripción |
+|---|---|---|
+| `KERNEL_SCRIPT_PATH` | `../../scripts/load_kernel_module.sh` | Ruta al script de carga del módulo |
+| `KERNEL_UNLOAD_SCRIPT_PATH` | `../../scripts/unload_kernel_module.sh` | Script de descarga |
+| `CRON_SCRIPT_PATH` | `../../scripts/create_containers.sh` | Script del cronjob |
+| `FILE_READER_SERVICE_MEM_PATH` | `/proc/meminfo_pr2_so1_201905884` | Entrada /proc de RAM |
+| `FILE_READER_SERVICE_CONT_PATH` | `/proc/continfo_pr2_so1_201905884` | Entrada /proc de contenedores |
+| `COMPOSE_FILE_PATH` | `../../docker/docker-compose.yml` | Archivo docker-compose |
+| `VALKEY_ADDR` | `localhost:6379` | Dirección del servidor Valkey |
+| `VALKEY_KEY_MEM` | `meminfo` | Clave lista de RAM |
+| `VALKEY_KEY_CONT` | `continfo` | Clave lista de contenedores |
+| `VALKEY_KEY_PROC` | `procinfo` | Clave lista de procesos por contenedor |
+| `VALKEY_KEY_RSS_RANK` | `rss_rank` | Clave sorted-set de ranking RAM |
+| `VALKEY_KEY_CPU_RANK` | `cpu_rank` | Clave sorted-set de ranking CPU |
+| `VALKEY_KEY_CONTAINERS` | `containers` | Clave hash de estado actual |
+
+---
+## 5. Proceso de Lectura/Escritura en Valkey
+
+### 5.1 ¿Qué es Valkey?
+
+Valkey es un fork open-source de Redis, 100% compatible con el protocolo Redis. El daemon lo usa como
+base de datos en memoria para almacenar métricas en tiempo real. Grafana lo lee a través del plugin `redis-datasource`.
+
+### 5.2 Tres tipos de escritores (sink/valkey.go)
+
+#### ValkeyWriter — Listas (historial cronológico)
 
 ```go
-package main
+type ValkeyWriter struct {
+    Client *redis.Client
+    Key    string
+}
 
-import (
-	"context"
-	"fmt"
-	"log"
-
-	"github.com/redis/go-redis/v9"
-)
-
-const (
-	valkeyHost    = "127.0.0.1"
-	valkeyPort    = 6379
-	valkeyLatest  = "telemetria:latest"
-	valkeyHistory = "telemetria:history"
-	historyMax    = 1000
-)
-
-func pushToValkey(jsonStr string) {
-	ctx := context.Background()
-
-	client := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%d", valkeyHost, valkeyPort),
-	})
-	defer client.Close()
-
-	// Verificar conexión
-	if err := client.Ping(ctx).Err(); err != nil {
-		log.Printf("[valkey] no se pudo conectar a %s:%d — %v", valkeyHost, valkeyPort, err)
-		return
-	}
-
-	// Última lectura siempre disponible en O(1)
-	if err := client.Set(ctx, valkeyLatest, jsonStr, 0).Err(); err != nil {
-		log.Printf("[valkey] error en SET %s: %v", valkeyLatest, err)
-	}
-
-	// Insertar al frente del historial
-	if err := client.LPush(ctx, valkeyHistory, jsonStr).Err(); err != nil {
-		log.Printf("[valkey] error en LPUSH %s: %v", valkeyHistory, err)
-	}
-
-	// Mantener solo las últimas historyMax entradas
-	if err := client.LTrim(ctx, valkeyHistory, 0, historyMax-1).Err(); err != nil {
-		log.Printf("[valkey] error en LTRIM %s: %v", valkeyHistory, err)
-	}
+func (v *ValkeyWriter) Write(data any) error {
+    b, _ := json.Marshal(data)
+    v.Client.RPush(ctx, v.Key, b)   // Agrega al FINAL de la lista
+    return nil
 }
 ```
 
-**Por qué funciona así:**
+Comando Valkey: `RPUSH <key> <json_bytes>`
 
-| Decisión | Razón |
-|---|---|
-| `client.Ping()` antes de operar | Detecta fallo de conexión temprano y loguea sin crashear el daemon |
-| `SET telemetria:latest` sin TTL (`0`) | La lectura más reciente siempre disponible hasta ser sobreescrita |
-| `LPUSH` + `LTRIM 0 999` | Implementa ring buffer: inserta al frente, recorta el fondo — O(1) amortizado |
-| `defer client.Close()` | Garantiza que la conexión TCP se cierra aunque algún comando falle |
-| `context.Background()` | Contexto sin timeout para operaciones simples; se puede cambiar a `WithTimeout` si se necesita |
+- Cada llamada agrega un elemento al final de la lista.
+- La lista crece indefinidamente guardando el historial completo.
+- El elemento más nuevo está al final: `LINDEX key -1`
+- El elemento más viejo está al inicio: `LINDEX key 0`
+
+#### ValkeyRankWriter — Sorted Sets (rankings sin duplicados)
+
+```go
+type ValkeyRankWriter struct {
+    Client *redis.Client
+    Key    string
+}
+
+func (v *ValkeyRankWriter) Upsert(score float64, member string) error {
+    v.Client.ZAdd(ctx, v.Key, redis.Z{Score: score, Member: member})
+    return nil
+}
+
+func (v *ValkeyRankWriter) Remove(member string) error {
+    v.Client.ZRem(ctx, v.Key, member)
+    return nil
+}
+```
+
+Comandos Valkey: `ZADD <key> <score> <member>` / `ZREM <key> <member>`
+
+- `member` = nombre del contenedor (único → no hay duplicados).
+- `score` = porcentaje de RAM o CPU como float64.
+- Si el contenedor ya existe, `ZADD` actualiza su score (upsert automático).
+- Si el contenedor se elimina, `ZREM` lo quita del ranking.
+- Permite consultas por rango: `ZRANGEBYSCORE rss_rank 0 5` = contenedores con menos del 5% RAM.
+
+#### ValkeyHashWriter — Hash (estado actual completo)
+
+```go
+type ValkeyHashWriter struct {
+    Client *redis.Client
+    Key    string
+}
+
+func (v *ValkeyHashWriter) HSet(field string, value any) error {
+    b, _ := json.Marshal(value)
+    v.Client.HSet(ctx, v.Key, field, b)
+    return nil
+}
+
+func (v *ValkeyHashWriter) HDel(field string) error {
+    v.Client.HDel(ctx, v.Key, field)
+    return nil
+}
+```
+
+Comandos Valkey: `HSET <key> <docker_id> <json>` / `HDEL <key> <docker_id>`
+
+- `field` = Docker ID completo (único por contenedor).
+- `value` = JSON completo con todas las métricas actuales del contenedor.
+- `HGETALL containers` devuelve el estado actual de todos los contenedores activos.
+- Al eliminar un contenedor, `HDEL` lo quita del hash.
+
+### 5.3 Las 6 Claves en Valkey
+
+| Clave | Tipo Redis | Escritura | Lectura en Grafana | Contenido |
+|---|---|---|---|---|
+| `meminfo` | List | `RPUSH` | `LRANGE meminfo 0 -1` | JSON de RAM por tick |
+| `continfo` | List | `RPUSH` | `LRANGE continfo 0 -1` | JSON de resumen de contenedores |
+| `procinfo` | List | `RPUSH` | `LRANGE procinfo 0 -1` | JSON de métricas por contenedor |
+| `rss_rank` | Sorted Set | `ZADD` | `ZRANGEBYSCORE rss_rank -inf +inf WITHSCORES` | Ranking por % RAM |
+| `cpu_rank` | Sorted Set | `ZADD` | `ZRANGEBYSCORE cpu_rank -inf +inf WITHSCORES` | Ranking por % CPU |
+| `containers` | Hash | `HSET` | `HGETALL containers` | Estado actual por docker_id |
+
+### 5.4 Formato JSON almacenado
+
+**Clave `meminfo`** (una entrada por tick):
+```json
+{
+  "total_ram_kb": 8157520,
+  "free_ram_kb":  3200000,
+  "used_ram_kb":  4957520,
+  "timestamp":    "2026-03-17T01:30:00Z"
+}
+```
+
+**Clave `continfo`** (una entrada por tick):
+```json
+{
+  "containers_active":   5,
+  "containers_exited":   2,
+  "containers_removed":  1,
+  "containers_inactive": 3,
+  "timestamp": "2026-03-17T01:30:00Z"
+}
+```
+
+**Clave `procinfo`** (una entrada por contenedor por tick):
+```json
+{
+  "docker_id":      "abc123def456...",
+  "pid":            5678,
+  "container_name": "my_alpine",
+  "image":          "alpine",
+  "status":         "active",
+  "rss_kb":         51200,
+  "vsz_kb":         102400,
+  "mem_perc_x100":  63,
+  "cpu_perc_x100":  412,
+  "timestamp":      "2026-03-17T01:30:00Z"
+}
+```
+
+**Sorted set `rss_rank`**:
+```
+member="my_alpine"       score=0.63   (0.63% RAM)
+member="go-client_abc"   score=2.15   (2.15% RAM)
+member="stress_xyz"      score=0.08   (0.08% RAM)
+```
+
+**Hash `containers`**:
+```
+field="abc123def456..."  →  value=<JSON completo del contenedor>
+field="def789ghi012..."  →  value=<JSON completo del contenedor>
+```
+
+### 5.5 Verificación directa en Valkey
+
+```bash
+# Conectar al cliente Valkey dentro del contenedor
+sudo docker exec -it valkey_so1 valkey-cli
+
+# Contar entradas en las listas
+LLEN meminfo
+LLEN continfo
+LLEN procinfo
+
+# Ver la última entrada de RAM (elemento -1 = último agregado)
+LINDEX meminfo -1
+
+# Ver los últimos 5 resúmenes de contenedores
+LRANGE continfo -5 -1
+
+# Ver ranking por RAM de menor a mayor consumo
+ZRANGEBYSCORE rss_rank -inf +inf WITHSCORES
+
+# Ver ranking por CPU de mayor a menor consumo
+ZREVRANGEBYSCORE cpu_rank +inf -inf WITHSCORES
+
+# Ver estado actual de todos los contenedores
+HGETALL containers
+
+# Ver todas las claves activas
+KEYS *
+```
+
+---
+## 6. Grafana — Visualización de Datos
+
+### 6.1 ¿Cómo se conecta Grafana a Valkey?
+
+Grafana usa el plugin `redis-datasource` que implementa el protocolo Redis (Valkey es 100% compatible).
+La conexión está preconfigurada en `docker/grafana/provisioning/datasources/valkey.yml`:
+
+```yaml
+apiVersion: 1
+
+datasources:
+  - name: Valkey
+    type: redis-datasource
+    access: proxy
+    url: redis://valkey:6379   # 'valkey' = nombre del servicio en Docker Compose
+    isDefault: true
+    editable: true
+```
+
+**Puntos clave:**
+
+- `access: proxy` → Grafana hace las queries desde el servidor, no desde el browser.
+- `url: redis://valkey:6379` → `valkey` se resuelve por DNS interno de la red Docker (`red_pr2_so1`).
+- El archivo se monta via volumen Docker en `/etc/grafana/provisioning/datasources/`.
+- Al arrancar Grafana, lee automáticamente este archivo y configura el datasource sin intervención manual.
+
+### 6.2 Queries disponibles en Grafana por tipo de panel
+
+| Panel | Tipo de query | Comando Valkey |
+|---|---|---|
+| Línea de tiempo RAM usada | Time series desde lista | `LRANGE meminfo 0 -1` |
+| RAM libre vs usada | Time series desde lista | `LRANGE meminfo 0 -1` |
+| Contenedores activos en el tiempo | Time series desde lista | `LRANGE continfo 0 -1` |
+| Historial de eliminaciones | Time series desde lista | `LRANGE continfo 0 -1` |
+| Ranking actual por RAM | Bar/Table desde sorted set | `ZRANGEBYSCORE rss_rank -inf +inf WITHSCORES` |
+| Ranking actual por CPU | Bar/Table desde sorted set | `ZRANGEBYSCORE cpu_rank -inf +inf WITHSCORES` |
+| Estado actual de contenedores | Table desde hash | `HGETALL containers` |
+
+### 6.3 Flujo completo de un dato hasta Grafana
+
+```
+1. El kernel escribe en /proc/meminfo_pr2_so1_201905884 al ser leído:
+   { "memory_info": { "total_ram_kb": 8157520, "free_ram_kb": 3200000, "used_ram_kb": 4957520 } }
+
+2. El daemon (FileReader.Read) lee el archivo virtual:
+   rawMem = []byte(JSON crudo del kernel)
+
+3. parser.ParseMemInfo(rawMem) convierte el JSON a struct Go:
+   mem = model.MemStats{
+     MemTotal: 8157520, MemFree: 3200000, MemUsed: 4957520, Timestamp: now()
+   }
+
+4. ValkeyWriter.Write(mem) serializa y persiste en Valkey:
+   RPUSH meminfo '{"total_ram_kb":8157520,"free_ram_kb":3200000,"used_ram_kb":4957520,"timestamp":"..."}'
+
+5. Valkey mantiene la lista 'meminfo' con todas las lecturas históricas.
+
+6. Grafana (al abrir el dashboard o en auto-refresh):
+   redis-datasource ejecuta: LRANGE meminfo 0 -1
+   Recibe array de strings JSON
+
+7. Grafana parsea cada JSON, extrae los campos del panel configurado:
+   campo 'used_ram_kb' como valor Y, campo 'timestamp' como eje X
+
+8. El panel renderiza la línea de tiempo con la evolución de la RAM.
+```
+
+### 6.4 Acceso inicial a Grafana
+
+```bash
+# Abrir en el browser
+http://localhost:3000
+
+# Credenciales por defecto (configuradas en docker-compose.yml)
+# Usuario:    admin
+# Contraseña: admin
+
+# Navegar a Explore → seleccionar datasource 'Valkey'
+# Probar query: LRANGE meminfo 0 -1
+```
 
 ---
 
-## 5. Infraestructura Docker
+## 7. Gestión de Contenedores Docker
 
-### 5.1 Servicios
+### 7.1 El Cronjob
+
+Al iniciar, el daemon registra en el crontab del sistema:
+
+```cron
+*/2 * * * * /ruta/absoluta/create_containers.sh
+```
+
+El script `create_containers.sh` crea 5 contenedores aleatorios cada 2 minutos:
+
+| Tipo | Imagen | Comando | Categoría |
+|---|---|---|---|
+| Go-client | `roldyoran/go-client` | (default) | Alto consumo RAM |
+| Stress CPU | `alpine` | `while true; do echo '2^20' | bc; sleep 2; done` | Alto consumo CPU |
+| Sleep | `alpine` | `sleep 240` | Bajo consumo |
+
+### 7.2 Invariantes del Docker Manager
+
+El daemon mantiene siempre estas cantidades de contenedores activos:
+
+| Categoría | Target | Criterio al eliminar exceso |
+|---|---|---|
+| Bajo consumo (`alpine sleep`) | **3** | Elimina los de MAYOR consumo |
+| Alto consumo (`go-client` o `stress`) | **2** | Elimina los de MENOR consumo |
+| Sistema (`grafana`, `valkey`) | — | Nunca se tocan |
+
+### 7.3 Flujo de Enforce() en cada tick
+
+```
+Enforce(processes):
+  │
+  ├─ 1. docker ps → lista todos los contenedores activos
+  │
+  ├─ 2. classify() → categoriza cada contenedor:
+  │      grafana/valkey → System  (nunca eliminar)
+  │      alpine + sleep → Low     (bajo consumo)
+  │      go-client      → High    (alto consumo RAM)
+  │      alpine + bc    → High    (alto consumo CPU)
+  │
+  ├─ 3. enrichWithMetrics() → vincula métricas del kernel
+  │      Busca prefijo de 12 chars del container_id en los procesos de /proc
+  │      Suma RSS, VSZ, MemPct, CPURaw de todos los procesos del contenedor
+  │
+  ├─ 4. Aplicar invariantes:
+  │      Low > 3  → ordenar desc → eliminar los de mayor consumo
+  │      High > 2 → ordenar desc → eliminar los de menor consumo
+  │
+  ├─ 5. Crear faltantes:
+  │      Low < 3  → createLow()  → docker run -d alpine sleep 240
+  │      High < 2 → createHigh() → docker run -d go-client  (50% de probabilidad)
+  │                              → docker run -d alpine stress (50% de probabilidad)
+  │
+  └─ 6. Retornar EnforceResult:
+         ActiveContainers[]  → los que sobreviven (para rankings en Valkey)
+         RemovedContainers[] → los eliminados (para historial en Valkey)
+         Counts: Removed, ActiveLow, ActiveHigh, Exited
+```
+
+### 7.4 Contenedores en estado Exited
+
+Los contenedores `alpine sleep 240` terminan solos después de 4 minutos.
+El manager los detecta via `docker ps -a --filter status=exited` y los cuenta en `ContainersExited`.
+El cronjob repone los contenedores perdidos en la siguiente ejecución (cada 2 minutos).
+
+---
+
+## 8. Infraestructura Docker Compose
+
+### 8.1 Servicios
 
 | Servicio | Imagen | Puerto | Descripción |
 |---|---|---|---|
-| `valkey_so1` | `valkey/valkey:latest` | `6379` | Base de datos donde el daemon escribe métricas |
+| `valkey_so1` | `valkey/valkey:latest` | `6379` | Base de datos en memoria donde el daemon escribe métricas |
 | `grafana_so1` | `grafana/grafana:latest` | `3000` | Visualización via plugin redis-datasource |
 
-### 5.2 Keys en Valkey
+### 8.2 Comunicación entre componentes
 
-| Key | Tipo | Comando de escritura | Contenido |
-|---|---|---|---|
-| `meminfo` | Lista | `RPUSH` | Una entrada JSON por lectura de RAM |
-| `continfo` | Lista | `RPUSH` | Una entrada JSON por lectura de contenedores |
+```
+Host (daemon Go):                    Red red_pr2_so1 (bridge interna Docker):
+  localhost:6379 ──────────────────► valkey_so1:6379    (Valkey)
+  localhost:3000                     grafana_so1:3000   (Grafana)
+                                           │
+                              redis://valkey:6379 (DNS interno Docker)
+                                           ▼
+                                     valkey_so1:6379    (misma instancia)
+```
 
-### 5.3 Comandos de verificación
+- El daemon Go corre en el **host**, accede a Valkey via `localhost:6379`.
+- Grafana corre en un **contenedor**, accede a Valkey via `redis://valkey:6379`.
+- Ambos acceden a la **misma instancia** de Valkey.
+
+### 8.3 Comandos de gestión
 
 ```bash
-# Cantidad de entradas
-sudo docker exec -it valkey_so1 valkey-cli LLEN meminfo
-sudo docker exec -it valkey_so1 valkey-cli LLEN continfo
+# Levantar servicios
+sudo docker compose -f Daemon/docker/docker-compose.yml up -d
 
-# Ultima entrada
-sudo docker exec -it valkey_so1 valkey-cli LINDEX meminfo -1
+# Ver estado
+sudo docker compose -f Daemon/docker/docker-compose.yml ps
 
-# Rango completo
-sudo docker exec -it valkey_so1 valkey-cli LRANGE meminfo 0 -1
+# Ver logs
+sudo docker compose -f Daemon/docker/docker-compose.yml logs -f
 
-# Grafana
-# http://localhost:3000 → Explore → Valkey → LRANGE meminfo 0 -1
+# Detener (mantiene datos en volúmenes)
+sudo docker compose -f Daemon/docker/docker-compose.yml stop
+
+# Detener y eliminar contenedores
+sudo docker compose -f Daemon/docker/docker-compose.yml down
+
+# Detener y eliminar todo incluyendo datos
+sudo docker compose -f Daemon/docker/docker-compose.yml down -v
 ```
 
 ---
 
-## 6. Errores comunes y solución
+## 9. Ejecución Completa del Proyecto
 
-| Error | Causa | Solución |
-|---|---|---|
-| `ERROR: could not insert module: Unknown symbol` | Símbolo del kernel no exportado | Verificar que `CONFIG_MEMCG=y` en el kernel actual |
-| `make: Nothing to be done` | Archivos ya compilados | `make clean && make` |
-| `insmod: ERROR: could not insert module: Operation not permitted` | Secure Boot activo | Deshabilitar Secure Boot en BIOS o firmar el módulo |
-| `cat: /proc/meminfo_pr2_so1_201905884: No such file or directory` | Módulo no cargado | `sudo insmod pr2_so1_201905884.ko` |
-| `dial tcp 127.0.0.1:6379: connect: connection refused` | Valkey no corre | `sudo systemctl start valkey` |
-| `permission denied` al escribir log | Falta `/var/log/proyecto2` | `sudo mkdir -p /var/log/proyecto2 && sudo chmod 777 /var/log/proyecto2` |
+### 9.1 Prerrequisitos
+
+```bash
+# Headers del kernel (para compilar el módulo)
+sudo apt install linux-headers-$(uname -r)
+
+# Go (para compilar el daemon)
+sudo apt install golang-go
+
+# Docker y Docker Compose v2
+sudo apt install docker.io docker-compose-v2
+
+# Dependencias Go del proyecto
+cd Daemon && go mod download
+```
+
+### 9.2 Ejecución
+
+```bash
+cd Daemon/cmd/daemon
+sudo go run .
+```
+
+### 9.3 Salida esperada
+
+```
+main: archivo .env cargado exitosamente
+main: cargando módulo de Kernel ...
+kernel: [kernel-loader] compilando para kernel 6.x.x-generic...
+kernel: [kernel-loader] compilación OK
+kernel: [kernel-loader] módulo cargado OK
+main: módulo de Kernel cargado exitosamente
+main: levantando contenedores de Grafana y Valkey ...
+[+] Running 2/2
+ Container valkey_so1   Started
+ Container grafana_so1  Started
+main: contenedores de Grafana y Valkey levantados exitosamente
+main: cronjob registrado (cada 2 minutos)
+main: daemon iniciado
+service: próxima ejecución en 34s
+```
 
 ---
 
-## 7. Comandos rápidos de referencia
+## 10. Errores Comunes y Solución
+
+| Error | Causa | Solución |
+|---|---|---|
+| `no se pudo cargar el archivo .env` | No se ejecuta desde `cmd/daemon/` | `cd Daemon/cmd/daemon && sudo go run .` |
+| `kernel: script no encontrado` | Ruta incorrecta en `.env` | Verificar `KERNEL_SCRIPT_PATH` en `.env` |
+| `insmod: Operation not permitted` | Secure Boot activo | Deshabilitar Secure Boot en BIOS |
+| `Unknown symbol` al hacer insmod | `CONFIG_MEMCG=n` en el kernel | Verificar: `grep CONFIG_MEMCG /boot/config-$(uname -r)` |
+| `docker compose: command not found` | Docker Compose v2 no instalado | `sudo apt install docker-compose-v2` |
+| `connection refused` en Valkey | Contenedor no levantado | `sudo docker compose up -d` |
+| `/proc/meminfo_*: No such file` | Módulo no cargado | `sudo insmod Daemon/kernel/pr2_so1_201905884.ko` |
+| Grafana sin datos en el dashboard | Datasource no conectado | Verificar en `http://localhost:3000/datasources` |
+
+---
+
+## 11. Comandos Rápidos de Referencia
 
 ```bash
-# ── Kernel ──────────────────────────────────────────────
+# Kernel
 cd Daemon/kernel && make
 sudo insmod pr2_so1_201905884.ko
 cat /proc/meminfo_pr2_so1_201905884
 cat /proc/continfo_pr2_so1_201905884
+dmesg | tail -10
 sudo rmmod pr2_so1_201905884
+make clean
 
-# ── Daemon ──────────────────────────────────────────────
-cd Daemon
-go build -o daemon_bin ./cmd/daemon
-sudo go run cmd/daemon/main.go
+# Daemon
+cd Daemon/cmd/daemon && sudo go run .
 
-# ── Docker ──────────────────────────────────────────────
-cd Daemon/docker
-sudo docker compose up -d
-sudo docker compose down
-sudo docker compose ps
+# Docker
+sudo docker compose -f Daemon/docker/docker-compose.yml up -d
+sudo docker compose -f Daemon/docker/docker-compose.yml ps
+sudo docker compose -f Daemon/docker/docker-compose.yml down
 
-# ── Valkey ──────────────────────────────────────────────
-sudo docker exec -it valkey_so1 valkey-cli LLEN meminfo
-sudo docker exec -it valkey_so1 valkey-cli LINDEX meminfo -1
-sudo docker exec -it valkey_so1 valkey-cli LRANGE continfo 0 -1
+# Valkey (dentro del contenedor)
+sudo docker exec -it valkey_so1 valkey-cli
+LLEN meminfo
+LINDEX meminfo -1
+LRANGE continfo 0 -1
+ZRANGEBYSCORE rss_rank -inf +inf WITHSCORES
+HGETALL containers
+KEYS *
 
-# ── Grafana ─────────────────────────────────────────────
-# http://localhost:3000 (admin/admin)
+# Grafana: http://localhost:3000  (admin / admin)
 ```
