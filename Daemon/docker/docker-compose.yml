@@ -25,7 +25,7 @@ services:
         container_name: redisinsight_so1
         restart: unless-stopped
         ports:
-          - "8001:5540"
+          - "${REDIS_PORT:-8001}:5540"
         networks:
           - red_pr2_so1
         depends_on:

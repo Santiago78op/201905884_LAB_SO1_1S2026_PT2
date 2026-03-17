@@ -36,16 +36,16 @@ import (
 // containerRankEntry es una entrada de contenedor para el ranking en Valkey/Grafana.
 // Mantiene el formato original del kernel: mem_perc_x100 y cpu_perc_x100 como enteros.
 type containerRankEntry struct {
-	DockerID    string    `json:"docker_id"`
-	Pid         int       `json:"pid"`
-	Name        string    `json:"container_name"`
-	Image       string    `json:"image"`
-	Status      string    `json:"status"` // "active" | "removed"
-	RSSkb       uint64    `json:"rss_kb"`
-	VSZkb       uint64    `json:"vsz_kb"`
-	MemPctX100  uint64    `json:"mem_perc_x100"`
-	CPURawX100  uint64    `json:"cpu_perc_x100"`
-	Timestamp   time.Time `json:"timestamp"`
+	DockerID   string    `json:"docker_id"`
+	Pid        int       `json:"pid"`
+	Name       string    `json:"container_name"`
+	Image      string    `json:"image"`
+	Status     string    `json:"status"` // "active" | "removed"
+	RSSkb      uint64    `json:"rss_kb"`
+	VSZkb      uint64    `json:"vsz_kb"`
+	MemPctX100 uint64    `json:"mem_perc_x100"`
+	CPURawX100 uint64    `json:"cpu_perc_x100"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 // toPerc convierte un valor x100 del kernel a porcentaje real, nunca mayor a 100.00.
@@ -55,15 +55,15 @@ func toPerc(x100 uint64) float64 {
 }
 
 type Service struct {
-	MemReader     source.Reader
-	ContReader    source.Reader
-	MemWriter     sink.Writer
-	ContWriter    sink.Writer
-	ProcWriter    sink.Writer // una entrada por contenedor, para Top Rankings en Grafana
-	RssRankWriter     *sink.ValkeyRankWriter // sorted set por rss_kb — para ZRANGEBYSCORE sin duplicados
-	CpuRankWriter     *sink.ValkeyRankWriter // sorted set por cpu_perc_x100 — para ZRANGEBYSCORE sin duplicados
+	MemReader           source.Reader
+	ContReader          source.Reader
+	MemWriter           sink.Writer
+	ContWriter          sink.Writer
+	ProcWriter          sink.Writer            // una entrada por contenedor, para Top Rankings en Grafana
+	RssRankWriter       *sink.ValkeyRankWriter // sorted set por rss_kb — para ZRANGEBYSCORE sin duplicados
+	CpuRankWriter       *sink.ValkeyRankWriter // sorted set por cpu_perc_x100 — para ZRANGEBYSCORE sin duplicados
 	ContainerHashWriter *sink.ValkeyHashWriter // hash field=name value=JSON — estado actual completo para Grafana
-	Docker        *docker.Manager
+	Docker              *docker.Manager
 
 	totalContainersRemoved int
 }
