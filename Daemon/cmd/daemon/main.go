@@ -94,7 +94,7 @@ func main() {
 	log.Println("main: levantando contenedores de Grafana y Valkey ...")
 	composeFile := os.Getenv("COMPOSE_FILE_PATH")
 
-	cmdCompose := exec.Command("sudo", "docker", "compose", "-f", composeFile, "up", "-d")
+	cmdCompose := exec.Command("docker", "compose", "-f", composeFile, "up", "-d")
 	cmdCompose.Stdout = os.Stdout
 	cmdCompose.Stderr = os.Stderr
 
