@@ -20,6 +20,16 @@ services:
           - red_pr2_so1
         volumes:
           - valkey_data:/data
+  redisinsight:
+        image: redis/redisinsight:latest
+        container_name: redisinsight_so1
+        restart: unless-stopped
+        ports:
+          - "8001:5540"
+        networks:
+          - red_pr2_so1
+        depends_on:
+          - valkey
   grafana:
         image: grafana/grafana:latest
         container_name: grafana_so1
