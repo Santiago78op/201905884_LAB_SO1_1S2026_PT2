@@ -1,184 +1,317 @@
-# Daemon en Go — PR2 SO1 | 201905884
+# Documentacion Tecnica — PR2 SO1 | 201905884
 
-## Descripcion General
+Documentacion tecnica completa del modulo de kernel en C y del daemon en Go que conforman el sistema de monitoreo de contenedores Docker.
 
-El daemon es un proceso en espacio de usuario escrito en Go que:
+---
 
-1. Carga las variables de entorno desde `.env`
-2. Levanta los contenedores de Grafana y Valkey via Docker Compose
-3. Carga el modulo de kernel via script bash
-4. Lee periodicamente los archivos virtuales expuestos por el modulo en `/proc`
-5. Parsea los datos y los persiste en Valkey para su visualizacion en Grafana
+## Indice
 
-Fuentes que consume:
+1. [Vision general del sistema](#1-vision-general-del-sistema)
+2. [Modulo de kernel](#2-modulo-de-kernel)
+3. [Scripts bash](#3-scripts-bash)
+4. [Daemon Go — arquitectura](#4-daemon-go--arquitectura)
+5. [Paquete kernel — carga del modulo](#5-paquete-kernel--carga-del-modulo)
+6. [Paquete source — lectura de /proc](#6-paquete-source--lectura-de-proc)
+7. [Paquete model — structs de dominio](#7-paquete-model--structs-de-dominio)
+8. [Paquete parser — deserializacion](#8-paquete-parser--deserializacion)
+9. [Paquete docker — gestion de contenedores](#9-paquete-docker--gestion-de-contenedores)
+10. [Paquete sink — persistencia en Valkey](#10-paquete-sink--persistencia-en-valkey)
+11. [Paquete app — orquestador](#11-paquete-app--orquestador)
+12. [cmd/daemon/main.go — entrada](#12-cmddaemonmaingo--entrada)
+13. [Infraestructura Docker](#13-infraestructura-docker)
+14. [Integracion con systemd](#14-integracion-con-systemd)
+15. [Flujo de datos completo](#15-flujo-de-datos-completo)
+16. [Estructuras de datos en Valkey](#16-estructuras-de-datos-en-valkey)
+17. [Configuracion (.env)](#17-configuracion-env)
+18. [Decisiones de diseno](#18-decisiones-de-diseno)
+19. [Referencia de errores](#19-referencia-de-errores)
 
-- `/proc/meminfo_pr2_so1_201905884` → estadisticas de RAM
-- `/proc/continfo_pr2_so1_201905884` → procesos Docker y contenedores
+---
 
-Salidas que produce:
+## 1. Vision general del sistema
 
-- Valkey lista `meminfo` → una entrada JSON por lectura de memoria
-- Valkey lista `continfo` → una entrada JSON por lectura de contenedores
-
-## Arquitectura por Capas
-
-El daemon sigue un diseño de capas donde cada paquete tiene una unica responsabilidad. Ningun paquete conoce los detalles internos de otro.
-
-![Diagrama de arquitectura del daemon](img/idea.png)
-
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│                        KERNEL SPACE                             │
-│  /proc/meminfo_pr2_so1_201905884   → JSON RAM stats            │
-│  /proc/continfo_pr2_so1_201905884  → JSON procesos + cgroups   │
-└──────────────┬──────────────────────────────┬───────────────────┘
-               │ insmod (al inicio)            │ polling cada 5s
-┌──────────────▼──────────────────────────────▼───────────────────┐
-│                        USER SPACE (Go)                          │
-│                                                                 │
-│  godotenv.Load()            → carga variables de .env          │
-│          ↓                                                      │
-│  docker compose up -d       → levanta Grafana + Valkey         │
-│          ↓                                                      │
-│  kernel.Load()              → carga el .ko via script bash     │
-│          ↓                                                      │
-│  source.FileReader.Read()   → []byte (JSON crudo)              │
-│          ↓                                                      │
-│  parser.ParseMemInfo()      → model.MemStats                   │
-│  parser.ParseContInfo()     → model.ContainerReport            │
-│          ↓                                                      │
-│  sink.ValkeyWriter.Write()  → RPUSH meminfo / continfo         │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-┌──────────────────────────────▼──────────────────────────────────┐
-│                     DOCKER (docker compose)                     │
-│                                                                 │
-│  valkey_so1  (puerto 6379)  → almacena listas meminfo/continfo │
-│  grafana_so1 (puerto 3000)  → visualiza datos via redis-plugin │
-└─────────────────────────────────────────────────────────────────┘
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          KERNEL SPACE                               │
+│                                                                     │
+│  pr2_so1_201905884.ko                                               │
+│    __init: proc_create() x2                                         │
+│    meminfo_show()  -> JSON RAM (total/free/used en KB)              │
+│    continfo_show() -> JSON procesos Docker (PID/VSZ/RSS/CPU/cmdline)│
+│                                                                     │
+│  /proc/meminfo_pr2_so1_201905884                                    │
+│  /proc/continfo_pr2_so1_201905884                                   │
+└───────────────┬──────────────────────────┬──────────────────────────┘
+                │ insmod (al arrancar)      │ os.ReadFile() cada 20-60s
+┌───────────────▼──────────────────────────▼──────────────────────────┐
+│                        USER SPACE — Daemon Go                       │
+│                                                                     │
+│  main.go                                                            │
+│    godotenv.Load()     <- carga .env                                │
+│    kernel.Load()       <- insmod via script bash                    │
+│    docker compose up   <- levanta Grafana + Valkey                  │
+│    RegisterCronjob()   <- crea entrada en crontab del usuario       │
+│    svc.Run(ctx)        <- loop principal (20-60s aleatorio)         │
+│      FileReader.Read() <- []byte JSON crudo desde /proc             │
+│      parser.*          <- JSON crudo -> structs tipados             │
+│      docker.Enforce()  <- aplica invariantes (3 low + 2 high)       │
+│      sink.*            <- persiste en Valkey (LIST/ZSET/HASH)       │
+│    kernel.Unload()     <- rmmod al salir                            │
+│    RemoveCronjob()     <- limpia crontab al salir                   │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │ protocolo Redis (go-redis v9)
+┌───────────────────────────────▼─────────────────────────────────────┐
+│                    DOCKER COMPOSE (red red_pr2_so1)                 │
+│                                                                     │
+│  valkey_so1  :6379   LIST meminfo / continfo / procinfo             │
+│                      ZSET rss_rank / cpu_rank                       │
+│                      HASH containers                                │
+│                                                                     │
+│  grafana_so1 :3000   plugin redis-datasource -> consulta Valkey     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-## Estructura del Proyecto
+---
 
-```text
-201905884_LAB_SO1_1S2026_PT2/
-└── Daemon/
-    ├── cmd/
-    │   └── daemon/
-    │       └── main.go                # entrada: .env + compose up + kernel.Load + senales OS
-    ├── internal/
-    │   ├── kernel/
-    │   │   └── loader.go              # ejecuta el script bash desde Go
-    │   ├── app/
-    │   │   └── service.go             # orquestador: ticker + leer/parsear/escribir
-    │   ├── model/
-    │   │   └── metrics.go             # structs de dominio: MemStats, ContainerReport
-    │   ├── parser/
-    │   │   ├── meminfo.go             # JSON crudo → MemStats
-    │   │   └── continfo.go            # JSON crudo → ContainerReport
-    │   ├── sink/
-    │   │   ├── jsonfile.go            # struct → JSON Lines en archivo (legacy)
-    │   │   └── valkey.go              # struct → RPUSH en Valkey
-    │   └── source/
-    │       └── file_reader.go         # lee /proc con cancelacion por contexto
-    ├── docker/
-    │   ├── docker-compose.yml         # Grafana + Valkey en red compartida
-    │   └── grafana/
-    │       └── provisioning/
-    │           └── datasources/
-    │               └── valkey.yml     # datasource Valkey preconfigurado
-    ├── kernel/
-    │   ├── pr2_so1_201905884.c
-    │   └── Makefile
-    ├── scripts/
-    │   └── load_kernel_module.sh      # compila e instala el .ko; verifica /proc
-    ├── doc/
-    │   └── Daemon.md
-    ├── .env                           # variables de entorno del daemon
-    ├── go.mod
-    └── go.sum
-```
+## 2. Modulo de kernel
 
-**Regla de capas:** `app/service.go` no sabe como se lee ni como se parsea. Solo orquesta quien llama a quien y cada cuanto tiempo.
+**Archivo:** `Daemon/kernel/pr2_so1_201905884.c`
 
-## Componentes
+### Proposito
 
-### 1. kernel — Carga del modulo
+Exponer dos pseudo-archivos en el sistema de archivos virtual `/proc` que el daemon Go puede leer con una simple llamada a `os.ReadFile()`. Los datos se generan en cada lectura directamente desde las estructuras internas del kernel.
 
-Antes de que el daemon pueda leer `/proc`, el modulo de kernel debe estar insertado en el kernel en ejecucion. El paquete `kernel` encapsula esta responsabilidad.
+### Headers utilizados
 
-**Archivos involucrados:**
-
-- `scripts/load_kernel_module.sh` — script bash que realiza el trabajo real
-- `Daemon/internal/kernel/loader.go` — paquete Go que invoca el script
-
-#### scripts/load_kernel_module.sh
-
-El script tiene cinco responsabilidades en orden:
-
-| Paso | Comando | Que hace |
-|---|---|---|
-| 1 | `lsmod \| grep` | Si el modulo ya esta cargado, sale con exit 0 (idempotente) |
-| 2 | `[ ! -f .ko ]` + `make` | Compila el `.ko` solo si no existe todavia |
-| 3 | `insmod .ko [container_id=...]` | Inserta el modulo en el kernel; pasa el parametro opcional |
-| 4 | `[ -r /proc/... ]` | Verifica que ambas entradas `/proc` quedaron disponibles |
-| 5 | `echo OK` | Confirma exito; el daemon recibe esta linea en su log |
-
-Acepta un argumento opcional: el ID del contenedor Docker que el modulo usara para filtrar procesos via cgroup v2.
-
-```bash
-# Sin filtro de contenedor
-sudo ./scripts/load_kernel_module.sh
-
-# Con container ID
-sudo ./scripts/load_kernel_module.sh abc123def456
-```
-
-**Por que `set -euo pipefail`:**
-
-| Flag | Efecto |
+| Header | Uso |
 |---|---|
-| `-e` | Aborta si cualquier comando retorna codigo != 0 |
-| `-u` | Aborta si se usa una variable no definida |
-| `-o pipefail` | Propaga errores a traves de pipes (`cmd1 \| cmd2` falla si `cmd1` falla) |
+| `linux/proc_fs.h` | `proc_create()`, `proc_remove()` para gestionar entradas `/proc` |
+| `linux/seq_file.h` | `seq_printf()`, `single_open()` para escritura secuencial |
+| `linux/mmzone.h` | `si_meminfo()` para obtener estadisticas globales de RAM |
+| `linux/mm.h` | `get_task_mm()`, `get_mm_rss()`, `mmput()` para memoria por proceso |
+| `linux/sched/signal.h` | `for_each_process()` para iterar sobre todos los procesos |
+| `linux/cgroup.h` | `cgroup_path()` para obtener la ruta del cgroup de un proceso |
+| `linux/memcontrol.h` | `task_get_css()`, `memory_cgrp_id` para acceder al cgroup de memoria |
+| `linux/slab.h` | `kmalloc()`, `kfree()` para buffers dinamicos en espacio kernel |
+| `linux/jiffies.h` | `jiffies` para calcular uso de CPU acumulado |
+| `linux/mmap_lock.h` | `mmap_read_lock()` para acceso seguro a `mm_struct` |
 
-**Por que `BASH_SOURCE[0]` para calcular rutas:**
-Permite obtener la ruta absoluta del script sin importar desde que directorio se lo llame. `dirname` extrae la carpeta y `cd + pwd` la convierte en absoluta.
+### Constantes
 
-#### Daemon/internal/kernel/loader.go
+```c
+#define CARNET           "201905884"
+#define PROC_MEMINFO_NAME "meminfo_pr2_so1_201905884"
+#define PROC_CONTINFO_NAME "continfo_pr2_so1_201905884"
+#define CMDLINE          256   // longitud maxima del buffer de cmdline
+#define CONTAINER_ID     128   // longitud maxima del path de cgroup
+```
+
+### Identificacion de procesos Docker
+
+**`is_docker_infra(task)`** — retorna `true` para procesos de infraestructura Docker por nombre exacto: `dockerd`, `containerd`, `containerd-shim`, `containerd-shim-runc-v2`, `runc`.
+
+**`is_docker_process(task)`** — combina dos criterios:
+1. Es infraestructura Docker (por nombre)
+2. Su cgroup path contiene la cadena `"docker"` (workloads reales: `sleep`, `sh`, binarios Go, etc.)
+
+La deteccion por cgroup requiere `CONFIG_MEMCG` habilitado en el kernel. Si no esta habilitado, solo se detecta infraestructura por nombre.
+
+```c
+css = task_get_css(task, memory_cgrp_id);
+cgroup_path(css->cgroup, path, sizeof(path));
+in_docker = (strstr(path, "docker") != NULL);
+```
+
+### `meminfo_show()` — entrada /proc/meminfo
+
+Lee el estado global de RAM con `si_meminfo()` y escribe JSON:
+
+```json
+{
+  "memory_info": {
+    "total_ram_kb": 16384000,
+    "free_ram_kb": 8192000,
+    "used_ram_kb": 8192000
+  }
+}
+```
+
+Calculo:
+```c
+total_ram = (i.totalram * i.mem_unit) / 1024;
+free_ram  = (i.freeram  * i.mem_unit) / 1024;
+used_ram  = (total_ram >= free_ram) ? (total_ram - free_ram) : 0;
+```
+
+`i.mem_unit` es el tamano de pagina en bytes. La division entre 1024 convierte bytes a KB.
+
+### `continfo_show()` — entrada /proc/continfo
+
+Itera sobre todos los procesos con `for_each_process(task)` dentro de `rcu_read_lock()` y escribe un array JSON de procesos Docker.
+
+Para cada proceso incluido:
+
+| Campo | Calculo |
+|---|---|
+| `vsz_kb` | `mm->total_vm << (PAGE_SHIFT - 10)` — paginas virtuales a KB |
+| `rss_kb` | `get_mm_rss(mm) << (PAGE_SHIFT - 10)` — paginas residentes a KB |
+| `mem_perc_x100` | `(rss * 10000) / mem_total_ram` — porcentaje x100 para evitar floats |
+| `cpu_perc_x100` | `(task->utime + task->stime) * 10000 / jiffies` — ticks acumulados x100 |
+| `cmdline` | `get_process_cmdline(task)` — lee `mm->arg_start..arg_end` via `access_process_vm()` |
+| `container_id` | `get_container_id(task)` — extrae 12 chars despues de `"docker-"` en el cgroup path |
+
+Salida JSON:
+```json
+{
+  "system_metrics": { "total_ram_kb": 16384000, "free_ram_kb": 8000000, "used_ram_kb": 8384000 },
+  "processes": [
+    {
+      "pid": 1234,
+      "name": "dockerd",
+      "cmdline": "/usr/bin/dockerd -H fd://",
+      "vsz_kb": 1024000,
+      "rss_kb": 51200,
+      "mem_perc_x100": 312,
+      "cpu_perc_x100": 5423,
+      "container_id": "-"
+    },
+    {
+      "pid": 5678,
+      "name": "sh",
+      "cmdline": "sh -c while true; do echo '2^20' | bc > /dev/null; sleep 2; done",
+      "vsz_kb": 4096,
+      "rss_kb": 2048,
+      "mem_perc_x100": 12,
+      "cpu_perc_x100": 98700,
+      "container_id": "abc123def456"
+    }
+  ],
+  "docker_active": 7
+}
+```
+
+### `get_process_cmdline(task)`
+
+1. `get_task_mm(task)` — obtiene la estructura de memoria del proceso
+2. `mmap_read_lock(mm)` / `mmap_read_unlock(mm)` — acceso seguro a `arg_start` y `arg_end`
+3. `access_process_vm(task, arg_start, buf, len, 0)` — copia los argumentos del espacio de usuario
+4. Reemplaza `\0` entre argumentos por espacios para legibilidad
+5. `mmput(mm)` — libera la referencia al `mm_struct`
+
+### `get_container_id(task)`
+
+1. `task_get_css(task, memory_cgrp_id)` — obtiene el cgroup subsystem state de memoria
+2. `cgroup_path(css->cgroup, buf, size)` — obtiene la ruta completa del cgroup
+   - Ejemplo: `/system.slice/docker-abc123def456...scope`
+3. `strstr(path, "docker-")` — localiza el prefijo del ID
+4. `strscpy(container_id, p, 13)` — copia los primeros 12 caracteres del container ID
+
+### Inicializacion y limpieza
+
+```c
+static int __init pr2_module_init(void) {
+    proc_meminfo_entry  = proc_create(PROC_MEMINFO_NAME,  0444, NULL, &meminfo_fops);
+    proc_continfo_entry = proc_create(PROC_CONTINFO_NAME, 0444, NULL, &continfo_ops);
+    // Si falla continfo, elimina meminfo antes de retornar -ENOMEM
+}
+
+static void __exit pr2_module_exit(void) {
+    proc_remove(proc_continfo_entry);
+    proc_remove(proc_meminfo_entry);
+}
+```
+
+El permiso `0444` hace las entradas de solo lectura para todos los usuarios.
+
+---
+
+## 3. Scripts bash
+
+### `scripts/load_kernel_module.sh`
+
+| Paso | Accion | Por que |
+|---|---|---|
+| 1 | `lsmod \| grep MODULE_NAME` | Idempotente: si ya esta cargado, sale con exit 0 sin error |
+| 2 | `mktemp -d` + `cp` + `make` | Compila en directorio temporal porque `make` del kernel no soporta rutas con espacios |
+| 3 | `cp .ko` al directorio kernel | Guarda el binario compilado para el kernel en ejecucion |
+| 4 | `sudo insmod .ko` | Carga el modulo; requiere root |
+| 5 | `[ -r /proc/... ]` | Verifica que `__init` creo las entradas `/proc` correctamente |
+
+`set -euo pipefail` garantiza que cualquier fallo aborta el script completo.
+
+`BASH_SOURCE[0]` calcula la ruta absoluta del script independientemente del directorio desde donde se llame.
+
+### `scripts/unload_kernel_module.sh`
+
+1. Verifica que el modulo este cargado con `lsmod`
+2. `sudo rmmod MODULE_NAME` — descarga el modulo
+3. Advierte si las entradas `/proc` siguen presentes tras el `rmmod`
+
+### `scripts/create_containers.sh`
+
+Ejecutado por el cronjob cada 2 minutos. Crea 5 contenedores aleatorios:
+
+| Caso `RANDOM % 3` | Contenedor | Categoria |
+|---|---|---|
+| 0 | `roldyoran/go-client` | Alto consumo RAM |
+| 1 | `alpine sh -c "while true; do echo '2^20' \| bc > /dev/null; sleep 2; done"` | Alto consumo CPU |
+| 2 | `alpine sleep 240` | Bajo consumo |
+
+---
+
+## 4. Daemon Go — arquitectura
+
+```
+cmd/daemon/main.go          <- punto de entrada, conecta todas las piezas
+    |
+    +-- internal/kernel/    <- carga/descarga modulo via script bash
+    +-- internal/source/    <- lee /proc (interfaz Reader)
+    +-- internal/parser/    <- JSON crudo -> structs Go
+    +-- internal/model/     <- definicion de structs de dominio
+    +-- internal/docker/    <- gestiona contenedores con docker ps/stop/rm/run
+    +-- internal/sink/      <- escribe en Valkey (LIST/ZSET/HASH)
+    +-- internal/app/       <- orquesta el loop principal y el cronjob
+```
+
+**Regla de capas:** cada paquete solo conoce a los paquetes que importa explicitamente. `app/service.go` no sabe como se lee ni como se escribe; solo orquesta quien llama a quien.
+
+---
+
+## 5. Paquete kernel — carga del modulo
+
+**Archivo:** `internal/kernel/loader.go`
 
 ```go
 type LoadOpts struct {
-    ScriptPath  string
-    ContainerID string
+    ScriptPath  string   // ruta al script bash de carga
+    ContainerID string   // ID opcional de contenedor para filtrar
 }
 
 func Load(opts LoadOpts) error
+func Unload(scriptPath string) error
 ```
 
 **Flujo de `Load()`:**
+1. `os.Stat(ScriptPath)` — verifica existencia del script antes de ejecutar
+2. Construye `args = [ScriptPath, ContainerID?]`
+3. `exec.Command("/bin/bash", args...)` — invoca bash explicitamente, no depende del shebang
+4. `cmd.CombinedOutput()` — ejecuta y captura stdout+stderr; bloquea hasta terminar
+5. Loguea cada linea del script en el log del daemon
+6. Si exit code != 0, retorna `fmt.Errorf("kernel: error ...: %w", err)`
 
-1. `os.Stat(opts.ScriptPath)` — verifica que el script existe antes de ejecutar; da un error claro si no.
-2. Construye `args := []string{ScriptPath}` y agrega `ContainerID` si no esta vacio.
-3. `exec.Command("/bin/bash", args...)` — invoca bash explicitamente, no depende del shebang.
-4. `CombinedOutput()` — ejecuta el script y captura stdout + stderr en un unico buffer; espera a que termine.
-5. Loguea cada linea de salida del script en el log del daemon.
-6. Si el script retorno codigo != 0, retorna `fmt.Errorf("kernel: script fallo: %w", err)`.
+**Por que `CombinedOutput()` y no `Output()`:** el script puede escribir errores en stderr (mensajes de `insmod`). `CombinedOutput()` los mezcla en orden cronologico en el log del daemon.
 
-**Por que `CombinedOutput()` en vez de `Output()`:**
-El script puede escribir errores en stderr (por ejemplo el mensaje de `insmod`). Con `CombinedOutput()` ambos streams llegan al log del daemon en el orden en que fueron escritos.
+**Por que `%w` en `fmt.Errorf`:** envuelve el `*exec.ExitError` original. El caller puede inspeccionarlo con `errors.Is()` o `errors.As()` sin perder informacion.
 
-**Por que `fmt.Errorf` con `%w`:**
-El `%w` envuelve el error original (`*exec.ExitError`). El caller puede inspeccionarlo con `errors.Is()` o `errors.As()` sin perder la informacion del error subyacente.
+---
 
-### 2. source — Lectura de archivos
+## 6. Paquete source — lectura de /proc
 
-Define la interfaz `Reader` y su implementacion `FileReader`.
+**Archivo:** `internal/source/file_reader.go`
 
 ```go
 type Reader interface {
     Read(ctx context.Context) ([]byte, error)
-    Name() string
 }
 
 type FileReader struct {
@@ -187,150 +320,173 @@ type FileReader struct {
 ```
 
 **Flujo de `Read()`:**
+1. Verifica `ctx.Done()` — si el daemon esta apagandose, no inicia la lectura
+2. `os.ReadFile(r.Path)` — lee el pseudo-archivo completo en un buffer
+3. Envuelve el error con la ruta para diagnostico
 
-1. Verifica si el contexto fue cancelado (`ctx.Done()`). Si el daemon esta apagandose, no lee.
-2. Llama a `os.ReadFile(r.Path)` que carga el pseudo-archivo completo en memoria.
-3. Envuelve el error con la ruta del archivo para facilitar el diagnostico.
+**Por que polling y no inotify:** los archivos en `/proc` son virtuales, se generan en cada llamada a `read()`. Los watchers de inotify no detectan cambios en pseudo-archivos del kernel. El polling periodico es el metodo correcto.
 
-**Por que polling y no inotify:**
-Los archivos en `/proc` son virtuales (se generan en cada lectura). Los watchers como `inotify` no detectan cambios en pseudo-archivos del kernel. El polling cada N segundos es el metodo correcto y estable.
+**Por que `os.ReadFile()` y no `bufio.Scanner()`:** `/proc` garantiza atomicidad en la lectura completa. Leer linea a linea podria ver un snapshot inconsistente si el kernel actualiza los datos entre lecturas parciales.
 
-Salida esperada al leer `/proc/meminfo_pr2_so1_201905884`:
+---
 
-```text
-RAM_TOTAL_MB=7856
-RAM_FREE_MB=4120
-RAM_USED_MB=3736
-```
+## 7. Paquete model — structs de dominio
 
-Salida esperada al leer `/proc/continfo_pr2_so1_201905884`:
-
-```text
-container_id=abc123def456
-PID    NAME              VSZ_(KB)   RSS_(KB)   %MEM_PCT   %CPU_RAW   CONTAINER_ID
-1234   dockerd           102400     51200      1          9876543    -
-5678   containerd        204800     102400     2          1234567    abc123def456
-CONTAINERS_ACTIVE=1
-```
-
-### 3. model — Structs de dominio
-
-Define las estructuras que representan los datos del sistema.
+**Archivo:** `internal/model/metrics.go`
 
 ```go
+// Datos de memoria del sistema (de /proc/meminfo_*)
 type MemStats struct {
-    MemTotal  uint64
-    MemFree   uint64
-    MemUsed   uint64
-    Timestamp time.Time
+    MemTotal  uint64    `json:"total_ram_kb"`
+    MemFree   uint64    `json:"free_ram_kb"`
+    MemUsed   uint64    `json:"used_ram_kb"`
+    Timestamp time.Time `json:"timestamp"`
 }
 
+// Un proceso Docker con sus metricas de recursos
 type ProcessInfo struct {
-    Pid         int
-    Name        string
-    VSZkb       uint64
-    RSSkb       uint64
-    MemPct      uint64
-    CPURaw      uint64
-    ContainerID string
+    Pid         int    `json:"pid"`
+    Name        string `json:"name"`
+    Cmdline     string `json:"cmdline"`
+    VSZkb       uint64 `json:"vsz_kb"`
+    RSSkb       uint64 `json:"rss_kb"`
+    MemPct      uint64 `json:"mem_perc_x100"`   // porcentaje x100
+    CPURaw      uint64 `json:"cpu_perc_x100"`   // porcentaje x100
+    ContainerID string `json:"container_id"`
 }
 
+// Resumen del estado de contenedores en un tick
 type ContainerReport struct {
-    FilterID         string
-    Processes        []ProcessInfo
-    ContainersActive int
-    Timestamp        time.Time
+    Processes          []ProcessInfo `json:"-"`           // se guarda por separado en procinfo
+    ContainersActive   int           `json:"containers_active"`
+    ContainersExited   int           `json:"containers_exited"`
+    ContainersRemoved  int           `json:"containers_removed"`
+    ContainersInactive int           `json:"containers_inactive"`
+    Timestamp          time.Time     `json:"timestamp"`
+}
+
+// Wrapper del JSON que emite el modulo de kernel para continfo
+type JsonContInfo struct {
+    Processes    []ProcessInfo `json:"processes"`
+    DockerActive int           `json:"docker_active"`
 }
 ```
 
-**Por que `uint64` y no `int`:**
-El kernel escribe estos valores con el formato `%llu` (unsigned long long). Nunca son negativos. Usar `uint64` refleja exactamente el tipo de origen.
+**Por que `uint64`:** el kernel emite estos valores con `%llu` (unsigned long long). Nunca son negativos.
 
-**Por que `Timestamp` en los structs:**
-Al serializar a JSON Lines, cada entrada queda marcada con la hora exacta de la lectura. Esto permite correlacionar datos de meminfo y continfo en el tiempo.
+**Por que `x100` en `MemPct` y `CPURaw`:** el kernel evita floats multiplicando x100. `735` representa `7.35%`. El daemon convierte con `toPerc()` al escribir en los ZSET.
 
-### 4. parser — Texto a structs
+**Por que `json:"-"` en `Processes`:** los procesos se guardan individualmente en la lista `procinfo` de Valkey, no dentro del `ContainerReport`. Si se incluyeran, `continfo` tendria un JSON anidado enorme en cada entrada.
 
-Convierte los bytes crudos devueltos por `FileReader` en structs tipados.
+---
 
-#### meminfo.go
+## 8. Paquete parser — deserializacion
+
+### `parser/meminfo.go`
 
 ```go
+type kernelMemInfoWrapper struct {
+    MemoryInfo model.JsonMemInfo `json:"memory_info"`
+}
+
 func ParseMemInfo(raw string) (model.MemStats, error)
 ```
 
-Algoritmo:
+1. `json.Unmarshal([]byte(raw), &wrapper)` — deserializa el JSON anidado del kernel
+2. Mapea `wrapper.MemoryInfo` a `model.MemStats`
+3. Asigna `Timestamp = time.Now()`
 
-1. Divide el texto en lineas con `strings.Split(raw, "\n")`.
-2. Para cada linea usa `strings.SplitN(linea, "=", 2)` — el `2` garantiza maximo 2 partes aunque el valor contenga `=`.
-3. Aplica `strings.TrimSpace` a clave y valor.
-4. Con un `switch` sobre la clave asigna cada valor usando `strconv.ParseUint`.
-5. Valida que `MemTotal != 0` antes de retornar.
-6. Asigna `Timestamp = time.Now()`.
-
-#### continfo.go
+### `parser/continfo.go`
 
 ```go
-func ParseContInfo(raw string) (model.ContainerReport, error)
+func ParserContInfo(raw string) (model.ContainerReport, error)
 ```
 
-El archivo tiene cuatro tipos de lineas distintos que requieren estrategias diferentes:
+1. `json.Unmarshal([]byte(raw), &parsed)` — deserializa el JSON del kernel a `JsonContInfo`
+2. Mapea cada `ProcessInfo` del JSON al slice `report.Processes`
+3. Asigna `ContainersActive = parsed.DockerActive`
+4. Asigna `Timestamp = time.Now()`
 
-| Tipo | Ejemplo | Estrategia |
-|---|---|---|
-| A — metadata inicial | `container_id=abc123` | `HasPrefix` + `TrimPrefix` |
-| B — header | `PID\tNAME\tVSZ...` | `HasPrefix("PID\t")` → ignorar |
-| C — datos de proceso | `142\tdockerd\t102400...` | `Split("\t")`, 7 campos |
-| D — metadata final | `CONTAINERS_ACTIVE=1` | `HasPrefix` + `TrimPrefix` |
+---
 
-**Falla suave (Opcion B):**
-Si una linea de proceso tiene formato inesperado (menos de 7 campos, valor no numerico), se salta con `continue`. El daemon no muere por un dato mal formado en un momento de carga del kernel.
+## 9. Paquete docker — gestion de contenedores
+
+**Archivo:** `internal/docker/manager.go`
+
+### Categorias de contenedores
 
 ```go
-parts := strings.Split(line, "\t")
-if len(parts) != 7 {
-    continue  // opcion B: ignorar linea malformada
+const (
+    CategorySystem         // grafana, valkey — nunca eliminar
+    CategoryLowConsumption // alpine sleep 240
+    CategoryHighConsumption // go-client o alpine stress
+    CategoryUnknown
+)
+```
+
+### Invariantes
+
+```go
+const (
+    TargetLow  = 3   // siempre 3 contenedores de bajo consumo
+    TargetHigh = 2   // siempre 2 contenedores de alto consumo
+)
+```
+
+### `Enforce(processes []model.ProcessInfo) (EnforceResult, error)`
+
+Secuencia en cada tick:
+
+1. `list()` — `docker ps --no-trunc --format "{{.ID}}\t{{.Image}}\t{{.Command}}\t{{.Names}}"`
+2. `classify(c)` — determina categoria por imagen y comando
+3. `enrichWithMetrics(containers, processes)` — vincula metricas de `/proc/continfo` a cada contenedor
+   - El kernel usa los primeros 12 chars del container ID en `container_id`
+   - Los valores se **suman** si el contenedor tiene multiples procesos
+4. Aplica invariantes:
+   - **Bajo consumo en exceso:** `sortDesc()` y elimina los de **mayor consumo** (anomalos)
+   - **Alto consumo en exceso:** `sortDesc()` y elimina los de **menor consumo** (mantiene los mas activos)
+5. Crea contenedores si hay deficit (`createLow()` / `createHigh()`)
+6. `countExited()` — cuenta contenedores gestionados en estado `Exited`
+
+### `enrichWithMetrics()`
+
+```go
+// Agrega metricas de /proc al struct Container
+// El kernel retorna los primeros 12 chars del ID en container_id
+for _, p := range processes {
+    cid := p.ContainerID            // "abc123def456" (12 chars)
+    a.rss    += p.RSSkb             // suma todos los procesos del contenedor
+    a.vsz    += p.VSZkb
+    a.memPct += p.MemPct            // suma de valores x100
+    a.cpu    += p.CPURaw            // suma de valores x100
+}
+for i, c := range containers {
+    prefix := c.ID[:12]             // primeros 12 chars del ID completo
+    if a, ok := metrics[prefix]; ok {
+        containers[i].RSSkb  = a.rss
+        containers[i].MemPct = a.memPct
+        containers[i].CPURaw = a.cpu
+    }
 }
 ```
 
-Mapeo de columnas a campos del struct:
-
-| `parts[i]` | Campo | Tipo |
-|---|---|---|
-| `parts[0]` | `Pid` | `strconv.Atoi` |
-| `parts[1]` | `Name` | string directo |
-| `parts[2]` | `VSZkb` | `strconv.ParseUint` |
-| `parts[3]` | `RSSkb` | `strconv.ParseUint` |
-| `parts[4]` | `MemPct` | `strconv.ParseUint` |
-| `parts[5]` | `CPURaw` | `strconv.ParseUint` |
-| `parts[6]` | `ContainerID` | string directo (puede ser `"-"`) |
-
-### 5. sink — Persistencia de datos
-
-Define la interfaz `Writer` y dos implementaciones: `JSONLineFile` y `ValkeyWriter`.
+### `resourceScore(c Container) uint64`
 
 ```go
-type Writer interface {
-    Write(v any) error
-}
+return c.RSSkb + c.CPURaw
 ```
 
-#### 5.1 JSONLineFile (legacy)
+Metrica combinada para ordenar contenedores. Al sumar RAM y CPU raw, prioriza los que consumen mas en ambas dimensiones.
 
-```go
-type JSONLineFile struct {
-    Path string
-}
-```
+---
 
-**Flujo de `Write()`:**
+## 10. Paquete sink — persistencia en Valkey
 
-1. Abre el archivo con flags `O_CREATE|O_APPEND|O_WRONLY` y permisos `0o644`.
-2. `defer f.Close()` garantiza que el archivo se cierra aunque falle el paso siguiente.
-3. Serializa el struct a JSON con `json.Marshal(v)`.
-4. Escribe los bytes seguidos de `'\n'` al final del archivo.
+**Archivo:** `internal/sink/valkey.go`
 
-#### 5.2 ValkeyWriter
+El paquete define tres writers especializados, cada uno para un tipo de dato diferente en Valkey.
+
+### `ValkeyWriter` — listas (LIST)
 
 ```go
 type ValkeyWriter struct {
@@ -338,165 +494,261 @@ type ValkeyWriter struct {
     Key    string
 }
 
-func NewValkeyWriter(addr string, key string) *ValkeyWriter
-```
-
-**Flujo de `Write()`:**
-
-1. Serializa el struct a JSON con `json.Marshal(data)`.
-2. Ejecuta `RPUSH <Key> <json>` en Valkey — agrega al final de la lista.
-3. Envuelve cualquier error con contexto (`"valkey: error escribiendo en <key>"`).
-
-**Por que `RPUSH` y no `SET`:**
-`RPUSH` acumula historico en orden cronologico. Con `SET` solo existiria la ultima lectura y se perderia el historial.
-
-**Keys utilizadas en Valkey:**
-
-| Key | Tipo | Contenido |
-|---|---|---|
-| `meminfo` | Lista | Una entrada JSON por lectura de RAM |
-| `continfo` | Lista | Una entrada JSON por lectura de contenedores |
-
-**Comandos de verificacion:**
-
-```bash
-# Cantidad de entradas
-sudo docker exec -it valkey_so1 valkey-cli LLEN meminfo
-sudo docker exec -it valkey_so1 valkey-cli LLEN continfo
-
-# Ultima entrada
-sudo docker exec -it valkey_so1 valkey-cli LINDEX meminfo -1
-sudo docker exec -it valkey_so1 valkey-cli LINDEX continfo -1
-
-# Rango completo
-sudo docker exec -it valkey_so1 valkey-cli LRANGE meminfo 0 -1
-```
-
-### 6. app/service.go — Orquestador
-
-Coordina las capas anteriores sin conocer sus detalles internos.
-
-```go
-type Service struct {
-    MemReader  source.Reader
-    ContReader source.Reader
-    MemWriter  sink.Writer
-    ContWriter sink.Writer
-    Interval   time.Duration
+func (v *ValkeyWriter) Write(data any) error {
+    b, _ := json.Marshal(data)
+    v.Client.RPush(ctx, v.Key, b)   // RPUSH key <json>
 }
 ```
 
-**Metodo `Run`:**
+Comando Valkey: `RPUSH key value` — agrega al final de la lista en orden cronologico.
+
+Usado para: `meminfo`, `continfo`, `procinfo`.
+
+### `ValkeyRankWriter` — sorted sets (ZSET)
 
 ```go
-func (s *Service) Run(ctx context.Context) error {
-    ticker := time.NewTicker(s.Interval)
-    defer ticker.Stop()
+type ValkeyRankWriter struct {
+    Client *redis.Client
+    Key    string
+}
 
-    for {
-        select {
-        case <-ctx.Done():     // señal de apagado
-            return nil
-        case <-ticker.C:       // intervalo cumplido
-            s.tick(ctx)
-        }
+func (v *ValkeyRankWriter) Upsert(score float64, member string) error {
+    v.Client.ZAdd(ctx, v.Key, redis.Z{Score: score, Member: member})
+}
+
+func (v *ValkeyRankWriter) Remove(member string) error {
+    v.Client.ZRem(ctx, v.Key, member)
+}
+```
+
+Comandos Valkey: `ZADD key score member` / `ZREM key member`.
+
+- `member` = nombre del contenedor (garantiza unicidad — no hay duplicados por contenedor)
+- `score` = porcentaje real convertido por `toPerc()` (ej: `7.35`)
+
+Usado para: `rss_rank`, `cpu_rank`.
+
+### `ValkeyHashWriter` — hashes (HASH)
+
+```go
+type ValkeyHashWriter struct {
+    Client *redis.Client
+    Key    string
+}
+
+func (v *ValkeyHashWriter) HSet(field string, value any) error {
+    b, _ := json.Marshal(value)
+    v.Client.HSet(ctx, v.Key, field, b)   // HSET key field <json>
+}
+
+func (v *ValkeyHashWriter) HDel(field string) error {
+    v.Client.HDel(ctx, v.Key, field)      // HDEL key field
+}
+```
+
+- `field` = docker ID completo (64 chars)
+- `value` = JSON completo del contenedor (`containerRankEntry`)
+
+Siempre refleja el estado **actual** de los contenedores activos. Cuando un contenedor se elimina, `HDel` lo quita del hash. Grafana hace `HGETALL containers` y obtiene solo los vivos.
+
+Usado para: `containers`.
+
+---
+
+## 11. Paquete app — orquestador
+
+**Archivos:** `internal/app/service.go`, `internal/app/cronjob.go`
+
+### `Service`
+
+```go
+type Service struct {
+    MemReader           source.Reader
+    ContReader          source.Reader
+    MemWriter           sink.Writer
+    ContWriter          sink.Writer
+    ProcWriter          sink.Writer
+    RssRankWriter       *sink.ValkeyRankWriter
+    CpuRankWriter       *sink.ValkeyRankWriter
+    ContainerHashWriter *sink.ValkeyHashWriter
+    Docker              *docker.Manager
+    totalContainersRemoved int
+}
+```
+
+### `Run(ctx context.Context) error`
+
+Loop principal con intervalo aleatorio entre 20 y 60 segundos:
+
+```go
+for {
+    wait := time.Duration(20+rand.Intn(41)) * time.Second
+    select {
+    case <-ctx.Done():        // SIGTERM/SIGINT -> salir limpiamente
+        return nil
+    case <-time.After(wait):  // intervalo cumplido -> ejecutar tick
+        s.tick(ctx)
     }
 }
 ```
 
-El `select` escucha dos canales simultaneamente. Si llega una senal del OS (via `ctx.Done()`), el daemon sale limpiamente. Si pasa el intervalo, ejecuta un ciclo de lectura.
+El `select` escucha dos canales simultaneamente. El intervalo aleatorio evita patrones predecibles de carga.
 
-**Patron de error en cascada en `tick()`:**
-Cada paso depende del anterior. Si la lectura falla, no se parsea. Si el parseo falla, no se escribe. En ningun caso el error detiene el daemon, solo se loguea.
+### `tick(ctx context.Context)`
 
-```text
-Read() ok? → Parse() ok? → Write()
-     ↓ error       ↓ error
-   log + skip    log + skip
+Secuencia de operaciones en cada ciclo:
+
+```
+1. MemReader.Read()       -> JSON crudo de /proc/meminfo_*
+2. parser.ParseMemInfo()  -> model.MemStats
+3. MemWriter.Write()      -> RPUSH meminfo <JSON>
+
+4. ContReader.Read()      -> JSON crudo de /proc/continfo_*
+5. parser.ParserContInfo() -> model.ContainerReport
+6. docker.Enforce()       -> aplica invariantes, clasifica contenedores
+
+7. ContWriter.Write()     -> RPUSH continfo <JSON del ContainerReport>
+
+8. Para cada contenedor activo:
+   ProcWriter.Write()        -> RPUSH procinfo <JSON del containerRankEntry>
+   RssRankWriter.Upsert()    -> ZADD rss_rank toPerc(MemPct) nombre
+   CpuRankWriter.Upsert()    -> ZADD cpu_rank toPerc(CPURaw) nombre
+   ContainerHashWriter.HSet() -> HSET containers dockerID <JSON completo>
+
+9. Para cada contenedor eliminado:
+   ProcWriter.Write()        -> RPUSH procinfo <JSON con status="removed">
+   RssRankWriter.Remove()    -> ZREM rss_rank nombre
+   CpuRankWriter.Remove()    -> ZREM cpu_rank nombre
+   ContainerHashWriter.HDel() -> HDEL containers dockerID
 ```
 
-### 7. cmd/daemon/main.go — Entrada
+**Patron de error en cascada:** si un paso falla, se loguea y se salta al siguiente. El daemon nunca se detiene por un error en un tick individual.
 
-Conecta todas las piezas y maneja las senales del OS.
+### `containerRankEntry`
 
-**Secuencia de arranque:**
-
-1. Cargar `.env` con `godotenv.Load()`
-2. Parsear flags (`--kernel-script`, `--container-id`)
-3. Cargar modulo de kernel
-4. Levantar contenedores Docker (Grafana + Valkey)
-5. Configurar manejo de senales
-6. Crear `Service` con `ValkeyWriter`
-7. Ejecutar loop principal
-
-**Fragmento clave — levantado de contenedores:**
+Struct serializado a JSON para `procinfo` y `containers`:
 
 ```go
-composeFile := os.Getenv("COMPOSE_FILE_PATH")
-cmdCompose := exec.Command("sudo", "docker", "compose", "-f", composeFile, "up", "-d")
-cmdCompose.Stdout = os.Stdout
-cmdCompose.Stderr = os.Stderr
-if err := cmdCompose.Run(); err != nil {
-    log.Fatalf("main: error al levantar contenedores: %v", err)
+type containerRankEntry struct {
+    DockerID    string    `json:"docker_id"`
+    Pid         int       `json:"pid"`
+    Name        string    `json:"container_name"`
+    Image       string    `json:"image"`
+    Status      string    `json:"status"`      // "active" | "removed"
+    RSSkb       uint64    `json:"rss_kb"`
+    VSZkb       uint64    `json:"vsz_kb"`
+    MemPctX100  uint64    `json:"mem_perc_x100"` // valor x100 del kernel (sin convertir)
+    CPURawX100  uint64    `json:"cpu_perc_x100"` // valor x100 del kernel (sin convertir)
+    Timestamp   time.Time `json:"timestamp"`
 }
 ```
 
-**Fragmento clave — configuracion del Service con Valkey:**
+**Diferencia entre hash y ZSET:** el hash guarda el valor `x100` crudo (para inspeccion detallada), los ZSET guardan el score convertido a porcentaje real con `toPerc()` (para queries de rango).
+
+### `toPerc(x100 uint64) float64`
 
 ```go
-svc := &app.Service{
-    MemReader:  source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_MEM_PATH")},
-    ContReader: source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_CONT_PATH")},
-    MemWriter:  sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_MEM")),
-    ContWriter: sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CONT")),
-    Interval:   5 * time.Second,
-}
+v := math.Round(float64(x100)/100.0*100) / 100
+return math.Min(v, 100.00)
 ```
 
-**Por que `kernel.Load()` va antes de levantar contenedores:**
-Si el modulo no carga, las entradas `/proc` no existen. Fallar rapido con `log.Fatalf` evita arrancar en estado invalido.
+- Divide entre 100 para obtener el porcentaje real
+- Redondea a 2 decimales
+- Tapa en 100.00 (suma de procesos puede superar 100%)
 
-**Por que `docker compose up -d` en Go y no en el script:**
-El daemon es responsable de su propia infraestructura. Al iniciar levanta todo lo que necesita y al terminar (Paso 5) podra limpiarlo.
+### Cronjob (`cronjob.go`)
 
-**Por que `flag.String()` retorna `*string`:**
-`flag.String()` retorna un puntero. El `*` en `*kernelScript` lo desreferencia para obtener el valor string. Esto permite que el paquete `flag` modifique la variable internamente al hacer `Parse()`.
+**`RegisterCronjob(scriptPath string)`:**
+1. `crontab -l` — lee el crontab actual del usuario
+2. Agrega la entrada `*/2 * * * * <ruta_absoluta>/create_containers.sh`
+3. `crontab -` — escribe el nuevo crontab
 
-**Por que la goroutine para senales:**
-`<-sigChan` es una lectura bloqueante. Si estuviera en el hilo principal, el daemon nunca llegaria a `svc.Run()`. La goroutine espera la senal en paralelo mientras el daemon trabaja.
+**`RemoveCronjob(scriptPath string)`:**
+1. `crontab -l` — lee el crontab actual
+2. Filtra las lineas que contengan la ruta del script
+3. `crontab -` — escribe el crontab sin la entrada del daemon
 
-**Senales capturadas:**
+---
 
-| Senal | Origen tipico |
+## 12. cmd/daemon/main.go — entrada
+
+### Secuencia de arranque
+
+```
+1. godotenv.Load()              <- carga .env desde el working directory
+2. flag.Parse()                 <- procesa --kernel-script y --container-id
+3. kernel.Load()                <- insmod via script bash (fatal si falla)
+4. defer kernel.Unload()        <- rmmod al salir (garantizado por defer)
+5. docker compose up -d         <- levanta Grafana + Valkey
+6. app.RegisterCronjob()        <- registra crontab
+7. signal.Notify(SIGINT,SIGTERM) <- captura señales de apagado
+8. go func() { <-sigChan; cancel() } <- goroutine que espera señales
+9. svc.Run(ctx)                 <- loop principal (bloquea hasta cancel)
+10. app.RemoveCronjob()         <- elimina entrada del crontab
+```
+
+### Por que `kernel.Load()` antes del compose
+
+Si el modulo no carga, las entradas `/proc` no existen. Fallar rapido con `log.Fatalf` evita arrancar Grafana y Valkey para luego no tener datos que mostrar.
+
+### Por que goroutine para señales
+
+```go
+go func() {
+    sig := <-sigChan     // bloquea hasta recibir señal
+    cancel()             // cancela el contexto -> svc.Run() retorna
+}()
+svc.Run(ctx)             // bloquea en el loop principal
+```
+
+`<-sigChan` es bloqueante. Si estuviera en el hilo principal, el daemon nunca llegaria a `svc.Run()`. La goroutine espera la señal en paralelo.
+
+### Señales capturadas
+
+| Señal | Origen tipico |
 |---|---|
-| `SIGTERM` | `kill <pid>`, `systemd stop`, Docker al detener contenedor |
+| `SIGTERM` | `systemctl stop`, `kill <pid>`, Docker al detener el contenedor |
 | `SIGINT` | `Ctrl+C` en terminal |
 
-### 8. docker/ — Infraestructura
+---
 
-#### docker-compose.yml
+## 13. Infraestructura Docker
 
-Define dos servicios en una red compartida llamada `monitoring`:
+### `docker/docker-compose.yml`
 
-| Servicio | Imagen | Puerto | Proposito |
-|---|---|---|---|
-| `valkey_so1` | `valkey/valkey:latest` | `6379` | Base de datos donde el daemon escribe metricas |
-| `grafana_so1` | `grafana/grafana:latest` | `3000` | Visualizacion de datos desde Valkey |
+```yaml
+networks:
+  red_pr2_so1:
+    driver: bridge    # red privada entre servicios
 
-Variables de entorno usadas (desde `.env`):
+services:
+  valkey:
+    image: valkey/valkey:latest
+    container_name: valkey_so1
+    ports:
+      - "${VALKEY_PORT:-6379}:6379"
+    networks: [red_pr2_so1]
+    volumes:
+      - valkey_data:/data   # persistencia entre reinicios
 
-| Variable | Valor por defecto | Uso |
-|---|---|---|
-| `VALKEY_PORT` | `6379` | Puerto expuesto de Valkey |
-| `GRAFANA_PORT` | `3000` | Puerto expuesto de Grafana |
-| `GRAFANA_USER` | `admin` | Usuario inicial de Grafana |
-| `GRAFANA_PASSWORD` | `admin` | Contrasena inicial de Grafana |
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana_so1
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      - GF_INSTALL_PLUGINS=redis-datasource   # instala plugin al arrancar
+    networks: [red_pr2_so1]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on: [valkey]
+```
 
-El plugin `redis-datasource` se instala automaticamente en Grafana via la variable `GF_INSTALL_PLUGINS`. Este plugin es compatible con Valkey porque implementa el protocolo Redis.
+**Por que una red bridge propia:** los contenedores se resuelven por nombre de servicio (`valkey`, `grafana`) dentro de la red. Sin red compartida, Grafana no puede conectarse a `redis://valkey:6379`.
 
-#### grafana/provisioning/datasources/valkey.yml
+**Por que `GF_INSTALL_PLUGINS=redis-datasource`:** Valkey implementa el protocolo Redis. El plugin `redis-datasource` de Grafana es compatible y se instala automaticamente en cada arranque del contenedor.
 
-Configura automaticamente el datasource de Valkey en Grafana al iniciar el contenedor:
+### `grafana/provisioning/datasources/valkey.yml`
 
 ```yaml
 apiVersion: 1
@@ -504,184 +756,220 @@ datasources:
   - name: Valkey
     type: redis-datasource
     access: proxy
-    url: redis://valkey:6379
+    url: redis://valkey:6379    # 'valkey' = nombre del servicio en la red docker
     isDefault: true
     editable: true
 ```
 
-La URL usa `valkey` (nombre del servicio Docker) en lugar de `localhost` porque ambos contenedores estan en la misma red `monitoring`.
+`access: proxy` significa que Grafana hace las queries desde el servidor, no desde el navegador del usuario. Esto funciona porque Grafana y Valkey estan en la misma red Docker.
 
-#### .env
+---
 
-Centraliza toda la configuracion del daemon:
+## 14. Integracion con systemd
 
-```env
-# Kernel
-KERNEL_SCRIPT_PATH=scripts/load_kernel_module.sh
+El daemon ya esta preparado para systemd:
+- Captura `SIGTERM` (la señal que manda `systemctl stop`)
+- Realiza limpieza ordenada en los `defer` de `main()`
+- Escribe logs en stdout/stderr (redirigidos a `journald`)
 
-# Proc sources
-FILE_READER_SERVICE_MEM_PATH=/proc/meminfo_pr2_so1_201905884
-FILE_READER_SERVICE_CONT_PATH=/proc/continfo_pr2_so1_201905884
+### Unit file
 
-# Valkey
-VALKEY_ADDR=localhost:6379
-VALKEY_KEY_MEM=meminfo
-VALKEY_KEY_CONT=continfo
+```ini
+[Unit]
+Description=Daemon SO1 PT2 - Monitor de contenedores
+After=network.target docker.service
+Requires=docker.service
 
-# Docker Compose
-COMPOSE_FILE_PATH=docker/docker-compose.yml
+[Service]
+Type=simple
+User=julian
+WorkingDirectory=/home/julian/Julian/201905884_LAB_SO1_1S2026_PT2/Daemon/cmd/daemon
+ExecStart=/home/julian/Julian/201905884_LAB_SO1_1S2026_PT2/Daemon/daemon_so1
+Restart=no
+StandardOutput=journal
+StandardError=journal
 
-# Grafana
-GRAFANA_PORT=3000
-GRAFANA_USER=admin
-GRAFANA_PASSWORD=admin
+[Install]
+WantedBy=multi-user.target
 ```
 
-## Ciclo de Vida del Daemon
+**Por que `WorkingDirectory` apunta a `cmd/daemon/`:** `godotenv.Load()` busca `.env` en el directorio de trabajo. Las rutas relativas del `.env` (`../../scripts/...`) se resuelven correctamente desde `cmd/daemon/`.
 
-### 1. Compilar
+**Por que `Restart=no`:** el daemon descarga el modulo de kernel al salir. Si systemd lo reiniciara automaticamente despues de una falla, reintentaria `insmod` sin haber hecho `rmmod`, lo que causaria un error de "module already in use". Para reinicio automatico, primero se debe verificar el estado del modulo.
+
+### Comandos systemd
 
 ```bash
-cd Daemon
-go build -o daemon_bin ./cmd/daemon
+sudo systemctl daemon-reload          # recargar tras cambiar el unit file
+sudo systemctl start daemon-so1       # iniciar
+sudo systemctl stop daemon-so1        # detener (manda SIGTERM)
+sudo systemctl status daemon-so1      # estado y ultimas lineas de log
+sudo journalctl -u daemon-so1 -f      # logs en tiempo real
+sudo systemctl enable daemon-so1      # arrancar al boot
 ```
 
-### 2. Ejecutar
+---
 
-```bash
-# Desde la carpeta Daemon/ (carga .env automaticamente)
-sudo go run cmd/daemon/main.go
+## 15. Flujo de datos completo
 
-# O con el binario compilado
-sudo ./daemon_bin
+```
+/proc/meminfo_pr2_so1_201905884
+        |
+        | os.ReadFile() [source.FileReader]
+        v
+  []byte JSON crudo:
+  { "memory_info": { "total_ram_kb": 16384000, ... } }
+        |
+        | json.Unmarshal() [parser.ParseMemInfo]
+        v
+  model.MemStats { MemTotal: 16384000, MemFree: 8000000, Timestamp: now }
+        |
+        | json.Marshal() + RPUSH [sink.ValkeyWriter]
+        v
+  Valkey LIST "meminfo"
+  -> {"total_ram_kb":16384000,"free_ram_kb":8000000,"used_ram_kb":8384000,"timestamp":"2026-03-17T..."}
+
+
+/proc/continfo_pr2_so1_201905884
+        |
+        | os.ReadFile() [source.FileReader]
+        v
+  []byte JSON crudo:
+  { "processes": [{...}, {...}], "docker_active": 7 }
+        |
+        | json.Unmarshal() [parser.ParserContInfo]
+        v
+  model.ContainerReport { Processes: [...], ContainersActive: 7 }
+        |
+        | docker.Enforce() [docker.Manager]
+        v
+  EnforceResult {
+    ActiveContainers:  [c1, c2, c3, c4, c5],
+    RemovedContainers: [c6],
+    ActiveLow: 3, ActiveHigh: 2, Removed: 1
+  }
+        |
+        +---> RPUSH continfo <ContainerReport JSON>          [sink.ValkeyWriter]
+        |
+        +---> Para cada contenedor activo:
+        |       RPUSH procinfo <containerRankEntry JSON>     [sink.ValkeyWriter]
+        |       ZADD  rss_rank toPerc(MemPct) nombre        [sink.ValkeyRankWriter]
+        |       ZADD  cpu_rank toPerc(CPURaw) nombre        [sink.ValkeyRankWriter]
+        |       HSET  containers dockerID <JSON completo>   [sink.ValkeyHashWriter]
+        |
+        +---> Para cada contenedor eliminado:
+                RPUSH procinfo <containerRankEntry con status="removed">
+                ZREM  rss_rank nombre
+                ZREM  cpu_rank nombre
+                HDEL  containers dockerID
 ```
 
-Salida esperada en consola:
+---
 
-```text
-2026/03/14 18:57:15 main: archivo .env cargado exitosamente
-2026/03/14 18:57:15 main: cargando modulo de Kernel ...
-2026/03/14 18:57:15 kernel: [kernel-loader] modulo ya cargado
-2026/03/14 18:57:15 main: modulo de Kernel cargado exitosamente
-2026/03/14 18:57:15 main: levantando contenedores de Grafana y Valkey ...
-2026/03/14 18:57:18 main: contenedores de Grafana y Valkey levantados exitosamente
-2026/03/14 18:57:18 main: daemon iniciado
-```
+## 16. Estructuras de datos en Valkey
 
-### 3. Verificar datos en Valkey
+### LISTs — historial cronologico
 
-```bash
-# Cantidad de entradas acumuladas
-sudo docker exec -it valkey_so1 valkey-cli LLEN meminfo
-sudo docker exec -it valkey_so1 valkey-cli LLEN continfo
-
-# Ultima entrada
-sudo docker exec -it valkey_so1 valkey-cli LINDEX meminfo -1
-sudo docker exec -it valkey_so1 valkey-cli LINDEX continfo -1
-```
-
-### 4. Verificar en Grafana
-
-1. Abrir `http://localhost:3000`
-2. Ir a **Explore**
-3. Seleccionar datasource **Valkey**
-4. Query: `LRANGE meminfo 0 -1` o `LRANGE continfo 0 -1`
-
-### 4. Detener limpiamente
-
-```bash
-# Con Ctrl+C desde la terminal donde corre el daemon
-# o desde otra terminal:
-kill <pid>
-```
-
-Salida al detener:
-
-```text
-2026/03/01 10:00:20 Received signal: terminated, shutting down...
-2026/03/01 10:00:20 service: deteniendo...
-2026/03/01 10:00:20 main: daemon detenido
-```
-
-## Decisiones Tecnicas
-
-| Elemento | Decision | Razon |
+| Key | Comando escritura | Contenido por entrada |
 |---|---|---|
-| Script bash separado | `scripts/load_kernel_module.sh` fuera del binario Go | El script puede ejecutarse independientemente para diagnosticar el modulo sin correr el daemon |
-| Paquete `kernel` en Go | `exec.Command("/bin/bash", script)` | Mantiene la logica de carga aislada; `main.go` no sabe como se carga el modulo |
-| `set -euo pipefail` en el script | Abortar ante cualquier fallo | Impide que `insmod` falle silenciosamente y el daemon arranque sin modulo |
-| Verificacion de `/proc` en el script | `[ -r /proc/... ]` al final | Prueba de aceptacion: confirma que el modulo ejecuto su `__init` correctamente |
-| `lsmod` al inicio del script | Salida con exit 0 si ya esta cargado | Hace el daemon idempotente: puede reiniciarse sin error aunque el modulo ya este activo |
-| `kernel.Load()` antes del contexto | `log.Fatalf` si falla | Falla rapido: no tiene sentido iniciar el daemon si las entradas `/proc` no estan disponibles |
-| `flag.String()` para configuracion | `--kernel-script` y `--container-id` | Evita rutas hardcodeadas; facilita despliegue en distintos entornos |
-| `CombinedOutput()` en Go | stdout + stderr del script en un buffer | Todas las lineas del script llegan al log del daemon en el orden correcto |
-| `fmt.Errorf` con `%w` | Wrapping del error original | El caller puede inspeccionar el error subyacente con `errors.Is()`/`errors.As()` |
-| Interfaz `Reader` | `source.Reader` en vez de `source.FileReader` | Permite intercambiar la fuente sin modificar el service |
-| Interfaz `Writer` | `sink.Writer` con `any` | Acepta tanto `MemStats` como `ContainerReport` con el mismo metodo |
-| `select` con dos canales | `ctx.Done()` y `ticker.C` | Responde a senales y al ticker sin bloquear |
-| `defer ticker.Stop()` | Inmediatamente despues de `NewTicker` | Libera recursos si `Run` retorna antes del primer tick |
-| `os.ReadFile` en vez de `bufio.Scanner` | Lectura completa del pseudo-archivo | `/proc` es atomico: la lectura completa es mas segura que linea a linea |
-| JSON Lines en vez de array JSON | Append puro sin reescribir | Eficiente para logs de larga duracion; compatible con `tail -f` |
-| Falla suave en parsers | `continue` en lineas malformadas | Un dato corrupto no detiene el daemon |
-| `compile-time check` | `var _ Reader = FileReader{}` | El compilador verifica la implementacion sin necesidad de tests manuales |
+| `meminfo` | `RPUSH` | `{"total_ram_kb":N,"free_ram_kb":N,"used_ram_kb":N,"timestamp":"..."}` |
+| `continfo` | `RPUSH` | `{"containers_active":N,"containers_exited":N,"containers_removed":N,"containers_inactive":N,"timestamp":"..."}` |
+| `procinfo` | `RPUSH` | `{"docker_id":"...","pid":N,"container_name":"...","image":"...","status":"active\|removed","rss_kb":N,"vsz_kb":N,"mem_perc_x100":N,"cpu_perc_x100":N,"timestamp":"..."}` |
 
-## Errores Comunes
-
-| Error | Causa | Solucion |
-|---|---|---|
-| `kernel: script no encontrado` | Ruta incorrecta en `--kernel-script` | Ejecutar desde la raiz del proyecto o pasar ruta absoluta |
-| `kernel: script fallo` | `insmod` rechazo el modulo | Ver el log completo; revisar `dmesg` para el error del kernel |
-| `ERROR: /proc/meminfo_... no existe` | El modulo cargo pero `__init` fallo | `dmesg \| tail -20` para ver el error del kernel |
-| `error al leer el archivo /proc/...` | Modulo del kernel no cargado | Verificar con `lsmod \| grep pr2` y reejecutar el daemon |
-| `open sink file /tmp/...: permission denied` | Sin permisos en `/tmp` | `chmod 777 /tmp` o cambiar la ruta de salida |
-| `RAM_TOTAL_MB cannot be zero` | Archivo `/proc` vacio o malformado | Verificar `cat /proc/meminfo_pr2_so1_201905884` |
-| Daemon no responde a `Ctrl+C` | Senal no capturada | Verificar que `signal.Notify` incluye `syscall.SIGINT` |
-
-## Comandos de Referencia
-
-```bash
-# ── Compilar ─────────────────────────────────────────────
-cd Daemon
-go build -o daemon_bin ./cmd/daemon
-
-# ── Ejecutar ─────────────────────────────────────────────
-sudo go run cmd/daemon/main.go
-
-# ── Kernel ───────────────────────────────────────────────
-lsmod | grep pr2_so1_201905884          # verificar que el modulo esta cargado
-ls /proc/ | grep pr2                    # verificar entradas /proc
-sudo rmmod pr2_so1_201905884            # descargar manualmente
-
-# ── Docker ───────────────────────────────────────────────
-cd Daemon/docker
-sudo docker compose up -d               # levantar contenedores
-sudo docker compose down                # detener contenedores
-sudo docker compose ps                  # ver estado
-
-# ── Valkey ───────────────────────────────────────────────
-sudo docker exec -it valkey_so1 valkey-cli LLEN meminfo
-sudo docker exec -it valkey_so1 valkey-cli LLEN continfo
-sudo docker exec -it valkey_so1 valkey-cli LINDEX meminfo -1
-sudo docker exec -it valkey_so1 valkey-cli LRANGE meminfo 0 -1
-
-# ── Grafana ──────────────────────────────────────────────
-# Abrir http://localhost:3000 (admin/admin)
-
-# ── Detener el daemon ────────────────────────────────────
-kill $(pgrep daemon_bin)
+Queries de lectura:
+```
+LLEN    meminfo              # cantidad de entradas
+LINDEX  meminfo -1           # ultima entrada
+LRANGE  meminfo 0 -1         # historial completo
+LRANGE  procinfo 0 49        # ultimos 50 registros
 ```
 
-## Resumen
+### ZSETs — ranking sin duplicados
 
-| Aspecto | Descripcion |
+| Key | Score | Member |
+|---|---|---|
+| `rss_rank` | `toPerc(MemPct)` = porcentaje real de RAM (ej: `7.35`) | nombre del contenedor |
+| `cpu_rank` | `toPerc(CPURaw)` = porcentaje real de CPU (ej: `98.70`) | nombre del contenedor |
+
+Queries de lectura:
+```
+ZRANGEBYSCORE rss_rank -inf +inf WITHSCORES    # todos ordenados de menor a mayor RAM
+ZREVRANGEBYSCORE rss_rank +inf -inf WITHSCORES # todos ordenados de mayor a menor RAM
+ZRANGEBYSCORE rss_rank 50 +inf WITHSCORES      # contenedores con mas del 50% de RAM
+```
+
+### HASH — estado actual
+
+| Key | Field | Value |
+|---|---|---|
+| `containers` | docker ID (64 chars) | JSON completo del `containerRankEntry` |
+
+Siempre refleja el estado actual. `HDel` elimina el field cuando el contenedor es removido.
+
+Queries de lectura:
+```
+HGETALL  containers           # estado de todos los contenedores activos
+HGET     containers <dockerID> # estado de un contenedor especifico
+HKEYS    containers           # lista de docker IDs activos
+HLEN     containers           # cuantos contenedores hay activos
+```
+
+---
+
+## 17. Configuracion (.env)
+
+| Variable | Valor por defecto | Descripcion |
+|---|---|---|
+| `KERNEL_SCRIPT_PATH` | `../../scripts/load_kernel_module.sh` | Script de carga del modulo |
+| `KERNEL_UNLOAD_SCRIPT_PATH` | `../../scripts/unload_kernel_module.sh` | Script de descarga del modulo |
+| `CRON_SCRIPT_PATH` | `../../scripts/create_containers.sh` | Script ejecutado por el cronjob |
+| `FILE_READER_SERVICE_MEM_PATH` | `/proc/meminfo_pr2_so1_201905884` | Entrada /proc de memoria |
+| `FILE_READER_SERVICE_CONT_PATH` | `/proc/continfo_pr2_so1_201905884` | Entrada /proc de contenedores |
+| `COMPOSE_FILE_PATH` | `../../docker/docker-compose.yml` | docker-compose.yml |
+| `GRAFANA_PORT` | `3000` | Puerto expuesto de Grafana |
+| `GRAFANA_USER` | `admin` | Usuario inicial de Grafana |
+| `GRAFANA_PASSWORD` | `admin` | Contrasena inicial de Grafana |
+| `VALKEY_ADDR` | `localhost:6379` | Direccion de Valkey desde el host |
+| `VALKEY_KEY_MEM` | `meminfo` | Key de la lista de memoria en Valkey |
+| `VALKEY_KEY_CONT` | `continfo` | Key de la lista de contenedores en Valkey |
+| `VALKEY_KEY_PROC` | `procinfo` | Key de la lista de procesos en Valkey |
+| `VALKEY_KEY_RSS_RANK` | `rss_rank` | Key del ZSET de ranking por RAM |
+| `VALKEY_KEY_CPU_RANK` | `cpu_rank` | Key del ZSET de ranking por CPU |
+| `VALKEY_KEY_CONTAINERS` | `containers` | Key del HASH de estado actual |
+
+---
+
+## 18. Decisiones de diseno
+
+| Decision | Razon |
 |---|---|
-| Lenguaje | Go |
-| Patron | Capas: kernel → source → parser → model → sink, orquestado por service |
-| Fuentes | `/proc/meminfo_pr2_so1_201905884` y `/proc/continfo_pr2_so1_201905884` |
-| Salida | Valkey listas `meminfo` y `continfo` via `RPUSH` |
-| Visualizacion | Grafana en `http://localhost:3000` con plugin `redis-datasource` |
-| Infraestructura | Docker Compose: `valkey_so1` (6379) + `grafana_so1` (3000) |
-| Configuracion | Variables de entorno desde `Daemon/.env` |
-| Intervalo | 5 segundos (configurable via `Interval` en `main.go`) |
-| Apagado | Limpio via `SIGTERM` o `SIGINT` con contexto cancelable |
-| Tolerancia a fallos | Falla suave: errores se loguean, el daemon no se detiene |
+| Script bash separado para insmod | El script puede ejecutarse independientemente para diagnosticar el modulo sin correr el daemon entero |
+| `set -euo pipefail` en los scripts | Impide que `insmod` falle silenciosamente y el daemon arranque sin modulo |
+| Verificacion de `/proc` en el script | Prueba de aceptacion: confirma que el modulo ejecuto su `__init` correctamente |
+| `lsmod` al inicio del script de carga | Hace el daemon idempotente: puede reiniciarse sin error aunque el modulo ya este activo |
+| `kernel.Load()` antes del contexto | Falla rapido: no tiene sentido iniciar si las entradas `/proc` no estan disponibles |
+| Intervalo aleatorio 20-60s | Evita patrones predecibles de carga en el sistema |
+| Valores `x100` del kernel | El kernel evita floats multiplicando x100; `toPerc()` los convierte al escribir en ZSET |
+| ZSET con `member=nombre` y no ID | El nombre es estable; garantiza unicidad sin duplicados por reconexion de contenedor |
+| HASH con `field=dockerID` | El ID es inmutable; unicidad garantizada aunque cambien el nombre |
+| `RPush` en lugar de `SET` | Acumula historial cronologico en lugar de sobreescribir el ultimo valor |
+| `Processes json:"-"` en ContainerReport | Los procesos se guardan individualmente en `procinfo`; incluirlos en `continfo` crearia JSON enorme |
+| Goroutine para señales | `<-sigChan` es bloqueante; sin goroutine el daemon no llegaria a `svc.Run()` |
+| `defer kernel.Unload()` en main | Garantiza la descarga del modulo incluso si hay panic o error inesperado |
+| `WorkingDirectory=cmd/daemon/` en systemd | `godotenv.Load()` busca `.env` en el CWD; las rutas relativas del .env resuelven desde ahi |
+
+---
+
+## 19. Referencia de errores
+
+| Error en log | Causa | Solucion |
+|---|---|---|
+| `kernel: script no encontrado "..."` | Ruta incorrecta en `KERNEL_SCRIPT_PATH` o CWD incorrecto | Verificar `.env` y ejecutar desde `cmd/daemon/` |
+| `kernel: error al ejecutar el script` | `insmod` rechazo el modulo | `dmesg \| tail -20` para el error del kernel |
+| `ERROR: /proc/meminfo_... no existe` | El modulo cargo pero `__init` fallo al crear la entrada | `dmesg \| tail -20` |
+| `error al leer el archivo /proc/...` | Modulo no cargado | `lsmod \| grep pr2_so1_201905884` |
+| `main: error al levantar contenedores` | Docker no esta corriendo o usuario sin permisos | `systemctl start docker` y verificar grupo `docker` |
+| `valkey: error escribiendo en meminfo` | Valkey no esta corriendo | `docker ps \| grep valkey` |
+| `service: docker enforce` | Error ejecutando `docker ps` o `docker stop` | Verificar que docker esta corriendo y el usuario esta en el grupo `docker` |
+| `status=203/EXEC` en systemd | El binario no existe o la ruta en el unit file es incorrecta | Compilar: `go build -o daemon_so1 ./cmd/daemon` |
+| `crontab register: exit status 1` | El usuario no tiene permiso para modificar su crontab | Verificar que `crontab` esta disponible: `which crontab` |
