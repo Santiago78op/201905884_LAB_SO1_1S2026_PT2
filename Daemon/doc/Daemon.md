@@ -30,6 +30,8 @@ Documentacion tecnica completa del modulo de kernel en C y del daemon en Go que 
 
 ## 1. Vision general del sistema
 
+![Daemon Go](./img/idea.png)
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                          KERNEL SPACE                               │

@@ -12,3 +12,7 @@ Daemon/kernel/*.o
 Daemon/kernel/modules.order
 Daemon/kernel/Module.symvers
 Daemon/kernel/.tmp_versions/
+
+# Kernel Rust Module 
+Rust_Module/*.o
+Rust_Module/*.ko
