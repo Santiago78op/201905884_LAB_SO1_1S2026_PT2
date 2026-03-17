@@ -1,3 +1,7 @@
+#![no_std]
+#![feature(custom_attribute)] // Ya no funciona
+#![feature(abi_x86_interrupt)]
+
 
 // src/lib.rs
 /** 
@@ -14,14 +18,11 @@
  * which is necessary for writing interrupt handlers in Rust for the Linux kernel.
  * 
 */
-#![no_std]
-#![feature(custom_attributes)]
-#![feature(abi_x86_interrupt)]
 
 use core::ffi::c_void;
-use kernel_module::{c_types, module::{int_module, cleanup_module}};
+use kernel_module::{c_types, module::{init_module, cleanup_module}};
 
-#[inti]
+#[init]
 fn on_init() -> c_types::c_int {
     println!("Rust module init");
     println!("Hello, Kernel! 201905884");
@@ -32,3 +33,4 @@ fn on_init() -> c_types::c_int {
 fn on_cleanup() {
     println!("Rust module cleanup");
 }
+
