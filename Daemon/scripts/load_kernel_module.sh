@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # PROJECT_ROOT es el directorio padre de SCRIPT_DIR, asumiendo que este script está en un subdirectorio del proyecto.
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # KERNEL_DIR es el subdirectorio "Kernel" dentro del proyecto, donde se espera que esté el archivo .ko del módulo.
-KERNEL_DIR="${PROJECT_ROOT}/Kernel"
+KERNEL_DIR="${PROJECT_ROOT}/kernel"
 # KO_FILE es la ruta completa al archivo .ko del módulo, construida a partir de KERNEL_DIR y MODULE_NAME.
 KO_FILE="${KERNEL_DIR}/${MODULE_NAME}.ko"
 
@@ -33,20 +33,21 @@ if lsmod | grep -q "^${MODULE_NAME}[[:space:]]"; then
     exit 0
 fi
 
-# 2. Compilar solo si el .ko no existe
-# [ ! -f "${KO_FILE}" ] — si el .ko no existe todavía, lo compila con make
-if [ ! -f "${KO_FILE}" ]; then
-    echo "[kernel-loader] compilando..."
-    make -C "${KERNEL_DIR}"
-fi
+# 2. Compilar siempre en esta máquina para garantizar compatibilidad con el kernel en ejecución.
+# El .ko del repositorio puede haber sido compilado en otra máquina con distinto kernel.
+# El build del kernel no soporta rutas con espacios, por eso se usa un directorio temporal.
+echo "[kernel-loader] compilando para kernel $(uname -r)..."
+BUILD_TMP="$(mktemp -d /tmp/kernel_build_XXXXXX)"
+cp "${KERNEL_DIR}"/*.c "${KERNEL_DIR}"/Makefile "${BUILD_TMP}/"
+make -C "/lib/modules/$(uname -r)/build" M="${BUILD_TMP}" modules
+cp "${BUILD_TMP}/${MODULE_NAME}.ko" "${KO_FILE}"
+rm -rf "${BUILD_TMP}"
+echo "[kernel-loader] compilación OK"
 
 # 3. Cargar el módulo
-# insmod — carga el .ko en el kernel; si hay CONTAINER_ID, se lo pasa como parámetro al módulo
-if [ -n "${CONTAINER_ID}" ]; then
-    insmod "${KO_FILE}" container_id="${CONTAINER_ID}"
-else
-    insmod "${KO_FILE}"
-fi
+# insmod — carga el .ko en el kernel;
+sudo insmod "${KO_FILE}"
+
 
 # 4. Verificar que /proc fue creado
 # [ -r ... ] — verifica que las entradas /proc existen y son legibles; si no, el módulo falló al iniciarse

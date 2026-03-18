@@ -1,0 +1,14 @@
+# - type: redis-datasource — se usa el plugin que de Grafana
+# - url: redis://valkey:6379 — apunta al servicio valkey por nombre de red (no localhost)
+# - isDefault: true — lo marca como datasource principal
+
+
+apiVersion: 1                                                                                                                                                                               
+                  
+datasources:
+  - name: Valkey
+    type: redis-datasource
+    access: proxy
+    url: redis://valkey:6379
+    isDefault: true
+    editable: true

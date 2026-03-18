@@ -16,14 +16,17 @@ import (
 	"flag"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"daemon/internal/app"
+	"daemon/internal/docker"
 	"daemon/internal/kernel"
 	"daemon/internal/sink"
 	"daemon/internal/source"
+
+	"github.com/joho/godotenv"
 )
 
 /**
@@ -36,10 +39,18 @@ import (
  */
 func main() {
 
+	// Carga de Variables de Entorno env
+	err := godotenv.Load()
+	if err != nil {
+		log.Printf("main: no se pudo cargar el archivo .env: %v", err)
+	} else {
+		log.Println("main: archivo .env cargado exitosamente")
+	}
+
 	// Kernel script flag: permite especificar la ruta al script que carga el módulo del kernel, con un valor por defecto.
 	kernelScript := flag.String(
 		"kernel-script",
-		"scripts/load_kernel_module.sh",
+		os.Getenv("KERNEL_SCRIPT_PATH"),
 		"Ruta al script que carga el módulo de kernel",
 	)
 
@@ -68,6 +79,38 @@ func main() {
 
 	log.Println("main: módulo de Kernel cargado exitosamente")
 
+	// Al salir del daemon, descargar el módulo de kernel
+	unloadScript := os.Getenv("KERNEL_UNLOAD_SCRIPT_PATH")
+	defer func() {
+		log.Println("main: descargando módulo de kernel...")
+		if err := kernel.Unload(unloadScript); err != nil {
+			log.Printf("main: error descargando módulo de kernel: %v", err)
+		} else {
+			log.Println("main: módulo de kernel descargado exitosamente")
+		}
+	}()
+
+	// Levantar contenedores de Grafana y Valkey
+	log.Println("main: levantando contenedores de Grafana y Valkey ...")
+	composeFile := os.Getenv("COMPOSE_FILE_PATH")
+
+	cmdCompose := exec.Command("docker", "compose", "-f", composeFile, "up", "-d")
+	cmdCompose.Stdout = os.Stdout
+	cmdCompose.Stderr = os.Stderr
+
+	if err := cmdCompose.Run(); err != nil {
+		log.Fatalf("main: error al levantar contenedores con Docker Compose: %v", err)
+	}
+
+	log.Println("main: contenedores de Grafana y Valkey levantados exitosamente")
+
+	// Registrar cronjob (paso 2): crea 5 contenedores aleatorios cada 2 minutos
+	cronScript := os.Getenv("CRON_SCRIPT_PATH")
+	if err := app.RegisterCronjob(cronScript); err != nil {
+		log.Fatalf("main: error registrando cronjob: %v", err)
+	}
+	log.Println("main: cronjob registrado (cada 2 minutos)")
+
 	// Se parsean los flags para que estén disponibles en el programa.
 	flag.Parse()
 
@@ -85,7 +128,8 @@ func main() {
 			- SIGTERM → la que manda systemd, kill <pid>, o Docker al detener un contenedor
 			- SIGINT → la que produce Ctrl+C en terminal
 
-			Cuando llega cualquiera de las dos, se llama cancel(), lo que hace que ctx.Done() se cierre, lo que hace que service.Run() retorne nil limpiamente.
+			Cuando llega cualquiera de las dos, se llama cancel(), lo que hace que ctx.Done() se cierre,
+			lo que hace que service.Run() retorne nil limpiamente.
 	*/
 	// Captura de señales del Os para permitir una terminación limpia.
 	sigChan := make(chan os.Signal, 1)
@@ -100,17 +144,28 @@ func main() {
 
 	// Conector de todas las piezas del servicio
 	svc := &app.Service{
-		MemReader:  source.FileReader{Path: "/proc/meminfo_pr2_so1_201905884"},
-		ContReader: source.FileReader{Path: "/proc/continfo_pr2_so1_201905884"},
-		MemWriter:  sink.JSONLineFile{Path: "/tmp/meminfo.jsonl"},
-		ContWriter: sink.JSONLineFile{Path: "/tmp/continfo.jsonl"},
-		Interval:   5 * time.Second,
+		MemReader:     source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_MEM_PATH")},
+		ContReader:    source.FileReader{Path: os.Getenv("FILE_READER_SERVICE_CONT_PATH")},
+		MemWriter:     sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_MEM")),
+		ContWriter:    sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CONT")),
+		ProcWriter:    sink.NewValkeyWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_PROC")),
+		RssRankWriter:       sink.NewValkeyRankWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_RSS_RANK")),
+		CpuRankWriter:       sink.NewValkeyRankWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CPU_RANK")),
+		ContainerHashWriter: sink.NewValkeyHashWriter(os.Getenv("VALKEY_ADDR"), os.Getenv("VALKEY_KEY_CONTAINERS")),
+		Docker:        docker.NewManager(),
 	}
 
 	log.Println("main: daemon iniciado")
 
 	if err := svc.Run(ctx); err != nil {
 		log.Fatalf("main: error fatal: %v", err)
+	}
+
+	// Paso 5: eliminar el cronjob antes de finalizar
+	if err := app.RemoveCronjob(cronScript); err != nil {
+		log.Printf("main: error eliminando cronjob: %v", err)
+	} else {
+		log.Println("main: cronjob eliminado")
 	}
 
 	log.Println("main: daemon detenido")

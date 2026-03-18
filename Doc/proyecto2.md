@@ -10,27 +10,37 @@
 │                        KERNEL SPACE                         │
 │                                                             │
 │  pr2_so1_201905884.ko                                       │
-│  ├── /proc/meminfo_pr2_so1_201905884  → RAM total/free/used │
-│  └── /proc/continfo_pr2_so1_201905884 → procesos + cgroups  │
+│  ├── /proc/meminfo_pr2_so1_201905884  → JSON RAM stats      │
+│  └── /proc/continfo_pr2_so1_201905884 → JSON procesos       │
 └────────────────────────┬────────────────────────────────────┘
-                         │ lectura cada 5s
+                         │ polling cada 5s
 ┌────────────────────────▼────────────────────────────────────┐
-│                       USER SPACE                            │
+│                       USER SPACE (Go daemon)                │
 │                                                             │
-│  daemon (Go)                                                │
-│  ├── readMemInfo()   → parsea /proc/meminfo                 │
-│  ├── readContInfo()  → parsea /proc/continfo                │
-│  ├── json.Marshal()  → serializa Telemetry struct           │
-│  ├── writeLog()      → /var/log/proyecto2/telemetria.log    │
-│  └── pushToValkey()  → Valkey SET/LPUSH                     │
-└────────────┬───────────────────────────┬────────────────────┘
-             │                           │
-┌────────────▼──────────┐   ┌────────────▼────────────────────┐
-│  JSONL Log            │   │  Valkey                         │
-│  telemetria.log       │   │  telemetria:latest  (GET)       │
-│  {"timestamp":...}    │   │  telemetria:history (LRANGE)    │
-│  {"timestamp":...}    │   │                                 │
-└───────────────────────┘   └─────────────────────────────────┘
+│  Arranque:                                                  │
+│  ├── godotenv.Load()      → carga .env                      │
+│  ├── docker compose up -d → levanta Grafana + Valkey        │
+│  └── kernel.Load()        → insmod via script bash          │
+│                                                             │
+│  Loop cada 5s:                                              │
+│  ├── source.FileReader    → lee /proc                       │
+│  ├── parser.ParseMemInfo  → JSON → model.MemStats           │
+│  ├── parser.ParseContInfo → JSON → model.ContainerReport    │
+│  └── sink.ValkeyWriter    → RPUSH meminfo / continfo        │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────────┐
+│                  DOCKER COMPOSE                             │
+│                                                             │
+│  valkey_so1  (puerto 6379)                                  │
+│  ├── lista: meminfo   → entradas JSON de RAM                │
+│  └── lista: continfo  → entradas JSON de contenedores       │
+│                                                             │
+│  grafana_so1 (puerto 3000)                                  │
+│  ├── plugin: redis-datasource                               │
+│  ├── datasource: Valkey (redis://valkey:6379)               │
+│  └── visualizacion: http://localhost:3000                   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -43,13 +53,29 @@
 │   └── proyecto2.md
 ├── Enunciado/
 │   └── Proyecto2.pdf
-├── Kernel/
-│   ├── pr2_so1_201905884.c
-│   └── Makefile
 └── Daemon/
-    ├── main.go
-    ├── proc.go
-    ├── valkey.go
+    ├── cmd/daemon/main.go             # entrada del daemon
+    ├── internal/
+    │   ├── kernel/loader.go           # carga modulo via script
+    │   ├── app/service.go             # loop principal
+    │   ├── model/metrics.go           # structs de datos
+    │   ├── parser/meminfo.go          # JSON /proc → MemStats
+    │   ├── parser/continfo.go         # JSON /proc → ContainerReport
+    │   ├── sink/jsonfile.go           # escritura en archivo (legacy)
+    │   ├── sink/valkey.go             # escritura en Valkey (activo)
+    │   └── source/file_reader.go     # lectura de /proc
+    ├── docker/
+    │   ├── docker-compose.yml         # Grafana + Valkey
+    │   └── grafana/provisioning/
+    │       └── datasources/valkey.yml # datasource preconfigurado
+    ├── kernel/
+    │   ├── pr2_so1_201905884.c
+    │   └── Makefile
+    ├── scripts/
+    │   └── load_kernel_module.sh
+    ├── doc/
+    │   └── Daemon.md
+    ├── .env
     ├── go.mod
     └── go.sum
 ```
@@ -145,10 +171,9 @@ make clean                                  # limpiar binarios
 sudo apt install golang-go       # Debian/Ubuntu
 sudo pacman -S go                # Arch
 
-# Inicializar módulo e instalar go-redis
-cd Daemon
-go mod init daemon_pr2
+# Desde Daemon/ — instalar dependencias
 go get github.com/redis/go-redis/v9
+go get github.com/joho/godotenv
 ```
 
 ### 4.2 Estructura JSON generada
@@ -530,24 +555,37 @@ func pushToValkey(jsonStr string) {
 
 ---
 
-## 5. Valkey — Keys utilizadas
+## 5. Infraestructura Docker
 
-| Key | Comando | Descripción |
-|---|---|---|
-| `telemetria:latest` | `SET` | Última lectura siempre disponible |
-| `telemetria:history` | `LPUSH` + `LTRIM 0 999` | Ring buffer de últimas 1000 lecturas |
+### 5.1 Servicios
 
-### Comandos de verificación
+| Servicio | Imagen | Puerto | Descripción |
+|---|---|---|---|
+| `valkey_so1` | `valkey/valkey:latest` | `6379` | Base de datos donde el daemon escribe métricas |
+| `grafana_so1` | `grafana/grafana:latest` | `3000` | Visualización via plugin redis-datasource |
+
+### 5.2 Keys en Valkey
+
+| Key | Tipo | Comando de escritura | Contenido |
+|---|---|---|---|
+| `meminfo` | Lista | `RPUSH` | Una entrada JSON por lectura de RAM |
+| `continfo` | Lista | `RPUSH` | Una entrada JSON por lectura de contenedores |
+
+### 5.3 Comandos de verificación
 
 ```bash
-# Última lectura formateada
-valkey-cli GET telemetria:latest | jq .
+# Cantidad de entradas
+sudo docker exec -it valkey_so1 valkey-cli LLEN meminfo
+sudo docker exec -it valkey_so1 valkey-cli LLEN continfo
 
-# Últimas 3 lecturas del historial
-valkey-cli LRANGE telemetria:history 0 2 | jq .
+# Ultima entrada
+sudo docker exec -it valkey_so1 valkey-cli LINDEX meminfo -1
 
-# Seguir el log en tiempo real
-tail -f /var/log/proyecto2/telemetria.log | jq .
+# Rango completo
+sudo docker exec -it valkey_so1 valkey-cli LRANGE meminfo 0 -1
+
+# Grafana
+# http://localhost:3000 → Explore → Valkey → LRANGE meminfo 0 -1
 ```
 
 ---
@@ -569,7 +607,7 @@ tail -f /var/log/proyecto2/telemetria.log | jq .
 
 ```bash
 # ── Kernel ──────────────────────────────────────────────
-cd Kernel && make
+cd Daemon/kernel && make
 sudo insmod pr2_so1_201905884.ko
 cat /proc/meminfo_pr2_so1_201905884
 cat /proc/continfo_pr2_so1_201905884
@@ -577,13 +615,20 @@ sudo rmmod pr2_so1_201905884
 
 # ── Daemon ──────────────────────────────────────────────
 cd Daemon
-go build -o daemon_pr2 .
-sudo ./daemon_pr2
+go build -o daemon_bin ./cmd/daemon
+sudo go run cmd/daemon/main.go
+
+# ── Docker ──────────────────────────────────────────────
+cd Daemon/docker
+sudo docker compose up -d
+sudo docker compose down
+sudo docker compose ps
 
 # ── Valkey ──────────────────────────────────────────────
-valkey-cli GET telemetria:latest | jq .
-valkey-cli LRANGE telemetria:history 0 9 | jq .
+sudo docker exec -it valkey_so1 valkey-cli LLEN meminfo
+sudo docker exec -it valkey_so1 valkey-cli LINDEX meminfo -1
+sudo docker exec -it valkey_so1 valkey-cli LRANGE continfo 0 -1
 
-# ── Log ─────────────────────────────────────────────────
-tail -f /var/log/proyecto2/telemetria.log | jq .
+# ── Grafana ─────────────────────────────────────────────
+# http://localhost:3000 (admin/admin)
 ```
