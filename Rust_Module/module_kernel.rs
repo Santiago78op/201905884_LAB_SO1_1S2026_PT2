@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
-
-//! Modulo Rust hola mundo para el kernel Linux.
+#![doc = "Modulo Rust hola mundo para el kernel Linux."]
+#![allow(missing_docs)]
 
 use kernel::prelude::*;
 
