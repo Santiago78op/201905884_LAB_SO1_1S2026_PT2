@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 
+//! Modulo Rust hola mundo para el kernel Linux.
+
 use kernel::prelude::*;
 
 module! {
     type: RustHola,
-    name: "module_kernel",
+    name: "rust_hola",
     authors: ["Julian Reyes"],
     description: "Modulo Linux en Rust: hola mundo",
     license: "GPL",
