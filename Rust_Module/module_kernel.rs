@@ -4,7 +4,7 @@ use kernel::prelude::*;
 
 module! {
     type: RustHola,
-    name: "rust_hola",
+    name: "module_kernel",
     authors: ["Julian Reyes"],
     description: "Modulo Linux en Rust: hola mundo",
     license: "GPL",
