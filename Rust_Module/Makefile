@@ -1,0 +1,1 @@
+obj-$(CONFIG_SAMPLES_RUST) += module_kernel.o
