@@ -56,15 +56,14 @@ func toPerc(x100 uint64) float64 {
 }
 
 type Service struct {
-	MemReader           source.Reader
-	ContReader          source.Reader
-	MemWriter           sink.Writer
-	ContWriter          sink.Writer
-	ProcWriter          sink.Writer            // una entrada por contenedor, para Top Rankings en Grafana
-	RssRankWriter       *sink.ValkeyRankWriter // sorted set por rss_kb — para ZRANGEBYSCORE sin duplicados
-	CpuRankWriter       *sink.ValkeyRankWriter // sorted set por cpu_perc_x100 — para ZRANGEBYSCORE sin duplicados
-	ContainerHashWriter *sink.ValkeyHashWriter // hash field=name value=JSON — estado actual completo para Grafana
-	Docker              *docker.Manager
+	MemReader          source.Reader
+	ContReader         source.Reader
+	MemWriter          sink.Writer
+	ContWriter         sink.Writer
+	ProcWriter         sink.Writer                // una entrada por contenedor, para historial en Grafana
+	RssSnapshotWriter  *sink.ValkeySnapshotWriter // snapshot Top-N por RAM — DEL+ZADD por tick, sin duplicados
+	CpuSnapshotWriter  *sink.ValkeySnapshotWriter // snapshot Top-N por CPU — DEL+ZADD por tick, sin duplicados
+	Docker             *docker.Manager
 
 	totalContainersRemoved int
 }
@@ -177,54 +176,37 @@ func (s *Service) tick(ctx context.Context) {
 				}
 			}
 
-			// Actualizar sorted sets y hash: estado actual sin duplicados
-			// Hash keyed por docker_id → unicidad garantizada
-			// Sorted sets usan container_name como member y toPerc() como score
+			// Rankings históricos: ZADD sin DEL — acumula activos e inactivos de todos los ticks.
+			// Member = "<name> (<cid12>) PID:<pid>" → unicidad garantizada por container ID único.
+			// ZREVRANGE rss_rank 0 4 WITHSCORES → Top 5 RAM (activos + eliminados histórico).
+			// ZREVRANGE cpu_rank 0 4 WITHSCORES → Top 5 CPU (activos + eliminados histórico).
+			total := len(result.ActiveContainers) + len(result.RemovedContainers)
+			rssEntries := make([]sink.RankEntry, 0, total)
+			cpuEntries := make([]sink.RankEntry, 0, total)
 			for _, c := range result.ActiveContainers {
-				if s.RssRankWriter != nil {
-					if err := s.RssRankWriter.Upsert(toPerc(c.MemPct), c.Name); err != nil {
-						log.Printf("service: error upsert rss_rank %s: %v", c.ID[:12], err)
-					}
-				}
-				if s.CpuRankWriter != nil {
-					if err := s.CpuRankWriter.Upsert(toPerc(c.CPURaw), c.Name); err != nil {
-						log.Printf("service: error upsert cpu_rank %s: %v", c.ID[:12], err)
-					}
-				}
-				if s.ContainerHashWriter != nil {
-					entry := containerRankEntry{
-						DockerID:   c.ID,
-						Pid:        c.Pid,
-						Cmdline:    c.Cmdline,
-						Name:       c.Name,
-						Image:      c.Image,
-						Status:     "active",
-						RSSkb:      c.RSSkb,
-						VSZkb:      c.VSZkb,
-						MemPctX100: uint64(toPerc(c.MemPct)),
-						CPURawX100: uint64(toPerc(c.CPURaw)),
-						Timestamp:  cont.Timestamp,
-					}
-					if err := s.ContainerHashWriter.HSet(c.ID, entry); err != nil {
-						log.Printf("service: error hset containers %s: %v", c.ID[:12], err)
-					}
-				}
+				rssEntries = append(rssEntries, sink.RankEntry{
+					Pid: c.Pid, DockerID: c.ID, Name: c.Name, Score: toPerc(c.MemPct),
+				})
+				cpuEntries = append(cpuEntries, sink.RankEntry{
+					Pid: c.Pid, DockerID: c.ID, Name: c.Name, Score: toPerc(c.CPURaw),
+				})
 			}
 			for _, c := range result.RemovedContainers {
-				if s.RssRankWriter != nil {
-					if err := s.RssRankWriter.Remove(c.Name); err != nil {
-						log.Printf("service: error remove rss_rank %s: %v", c.ID[:12], err)
-					}
+				rssEntries = append(rssEntries, sink.RankEntry{
+					Pid: c.Pid, DockerID: c.ID, Name: c.Name, Score: toPerc(c.MemPct),
+				})
+				cpuEntries = append(cpuEntries, sink.RankEntry{
+					Pid: c.Pid, DockerID: c.ID, Name: c.Name, Score: toPerc(c.CPURaw),
+				})
+			}
+			if s.RssSnapshotWriter != nil {
+				if err := s.RssSnapshotWriter.Upsert(rssEntries); err != nil {
+					log.Printf("service: error upsert rss_rank: %v", err)
 				}
-				if s.CpuRankWriter != nil {
-					if err := s.CpuRankWriter.Remove(c.Name); err != nil {
-						log.Printf("service: error remove cpu_rank %s: %v", c.ID[:12], err)
-					}
-				}
-				if s.ContainerHashWriter != nil {
-					if err := s.ContainerHashWriter.HDel(c.ID); err != nil {
-						log.Printf("service: error hdel containers %s: %v", c.ID[:12], err)
-					}
+			}
+			if s.CpuSnapshotWriter != nil {
+				if err := s.CpuSnapshotWriter.Upsert(cpuEntries); err != nil {
+					log.Printf("service: error upsert cpu_rank: %v", err)
 				}
 			}
 		}
